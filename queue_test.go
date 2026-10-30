@@ -278,10 +278,11 @@ func TestQueueDrainAfterCloseSeesInFlight(t *testing.T) {
 			for range 4 {
 				wg.Go(func() {
 					for {
-						switch err := q.Push(context.Background(), round); err {
-						case nil:
+						err := q.Push(context.Background(), round)
+						switch {
+						case err == nil:
 							accepted.Add(1)
-						case lifecycle.ErrQueueClosed:
+						case errors.Is(err, lifecycle.ErrQueueClosed):
 							return
 						}
 						runtime.Gosched() // single-threaded targets have no preemption
