@@ -21,3 +21,6 @@
   numbers.
 - Commit subjects are short, English and imperative.
 - Never commit host names, IP addresses or credentials.
+- Loops that retry non-blocking calls (tests included) must yield, e.g. with
+  `runtime.Gosched()`: js/wasm has no preemption, so a spinning goroutine
+  starves every other one, and `go test -timeout` cannot fire.
