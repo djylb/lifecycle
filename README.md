@@ -1,8 +1,8 @@
 # lifecycle
 
 Structured concurrency and resource lifetimes for Go: a tree of scopes that
-own goroutines, `io.Closer`s and child scopes, and a bounded queue whose
-behaviour when full is chosen up front.
+own goroutines, `io.Closer`s and child scopes, a bounded queue whose
+behaviour when full is chosen up front, and newest-value-wins mailboxes.
 
 - Standard library only, tests included.
 - Every goroutine started with `Go` is joined; panics become errors with
@@ -121,6 +121,38 @@ available to `Pop` until the queue is empty, then `Pop` returns
 `ErrQueueClosed`. `Drain` removes the rest. `Stats` reports pushed,
 dropped, rejected and waited counts. Push and Pop do not allocate, apart
 from the timer of a `Block` push that has to wait with a `BlockTimeout`.
+
+## Latest and KeyedLatest
+
+For state where only the newest value matters, such as configuration or
+health updates:
+
+```go
+cfg := lifecycle.NewLatest(lifecycle.LatestConfig[*Config]{})
+cfg.Set(c) // never blocks; replaces a value not taken yet
+
+c, missed, err := cfg.Wait(ctx) // missed: values overwritten since the last Wait
+```
+
+`KeyedLatest` keeps the newest value per key for a bounded number of keys:
+
+```go
+h, err := lifecycle.NewKeyedLatest(lifecycle.KeyedLatestConfig[string, Health]{
+	Capacity: 1024,
+	Full:     lifecycle.Reject, // or DropOldest (evicts the oldest key) or Block
+})
+h.Set(ctx, "peer-1", Up)
+peer, state, err := h.Pop(ctx)
+```
+
+Keys come out in the order they became pending; a `Set` on a pending key
+replaces its value in place without moving it and never hits the full
+policy, which applies only to new keys. `OnDrop` receives every value that
+is overwritten or evicted before it was taken (required with
+`DropOldest`), outside any lock. `Close`, `Drain`, `Stats`, `ErrFull` and
+`ErrQueueClosed` behave as for `Queue`. `Set`, `Wait` and `Pop` do not
+allocate, apart from the timer of a `Block` set that has to wait with a
+`BlockTimeout`.
 
 ## lifecycletest
 

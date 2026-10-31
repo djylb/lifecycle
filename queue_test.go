@@ -259,6 +259,12 @@ func TestZeroQueue(t *testing.T) {
 	if err := q.Push(context.Background(), 1); err == nil {
 		t.Fatal("zero Queue accepted an item")
 	}
+	if _, err := q.Pop(context.Background()); err == nil {
+		t.Fatal("zero Queue Pop ok")
+	}
+	if _, ok := q.TryPop(); ok || q.Drain(nil) != 0 || q.Stats() != (lifecycle.QueueStats{}) || q.Close() != nil {
+		t.Fatal("zero Queue not empty")
+	}
 }
 
 // TestQueueDrainAfterCloseSeesInFlight: Drain right after Close, while

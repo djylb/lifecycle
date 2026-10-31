@@ -13,7 +13,8 @@
   `ErrClosed` and, for `Add`, the resource closed at once.
 - Start no goroutine beyond those listed in the package documentation;
   document any new one and how it ends.
-- Queue `Push`, `Pop` and `TryPop` stay allocation-free; there is no
+- Queue `Push`, `Pop` and `TryPop`, and the `Set`, `Wait`, `Pop` and
+  `TryPop`/`TryGet` of `Latest` and `KeyedLatest`, stay allocation-free; there is no
   unbounded mode.
 - Tests must not leak goroutines or timers, and stress tests are bounded
   in time.

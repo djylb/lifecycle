@@ -9,12 +9,13 @@ import (
 )
 
 var (
-	// ErrFull is returned by Push when the queue is full and its policy
-	// refuses the item: always under Reject, after BlockTimeout under Block.
+	// ErrFull is returned by Queue.Push and KeyedLatest.Set when there is no
+	// room and the policy refuses the value: always under Reject, after
+	// BlockTimeout under Block.
 	ErrFull = errors.New("lifecycle: queue full")
 
-	// ErrQueueClosed is returned by Push on a closed queue, and by Pop
-	// once a closed queue is empty.
+	// ErrQueueClosed is returned by Push and Set on a closed Queue, Latest
+	// or KeyedLatest, and by Pop and Wait once a closed one is empty.
 	ErrQueueClosed = errors.New("lifecycle: queue closed")
 )
 
@@ -231,6 +232,10 @@ func (q *Queue[T]) wait(ctx context.Context, v T) error {
 // and open. It returns ErrQueueClosed once the queue is closed and empty,
 // or ctx.Err() if ctx ends first.
 func (q *Queue[T]) Pop(ctx context.Context) (T, error) {
+	if q.done == nil {
+		var zero T
+		return zero, errZeroQueue
+	}
 	select {
 	case v := <-q.items:
 		return v, nil
@@ -295,6 +300,9 @@ func (q *Queue[T]) Drain(fn func(T)) int {
 // Close closes the queue; see [Queue]. It is idempotent and always returns
 // nil.
 func (q *Queue[T]) Close() error {
+	if q.done == nil {
+		return nil
+	}
 	q.once.Do(func() {
 		close(q.done)
 		if q.state.Add(queueClosedBit) == queueClosedBit {

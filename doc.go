@@ -1,6 +1,7 @@
 // Package lifecycle provides structured concurrency and resource lifetimes:
-// a tree of scopes that own goroutines, io.Closers and child scopes, and a
-// bounded queue with an explicit policy for when it is full.
+// a tree of scopes that own goroutines, io.Closers and child scopes, a
+// bounded queue with an explicit policy for when it is full, and
+// newest-value-wins mailboxes ([Latest], [KeyedLatest]).
 //
 // # Scopes
 //
@@ -62,5 +63,9 @@
 //     closed, the one goroutine of context.AfterFunc, which calls Close and
 //     ends. Closing the scope first unregisters it.
 //
-// [Queue] starts no goroutines.
+// [Queue], [Latest] and [KeyedLatest] start no goroutines. They must be
+// created with their constructors. On a zero value, the methods that return
+// an error (Push, Pop, Set, Wait) return an error saying so; the others act
+// as on an empty container (TryPop and TryGet find nothing, Drain removes
+// nothing, Stats, Len and Cap report zero, Close does nothing).
 package lifecycle
