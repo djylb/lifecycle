@@ -1,6 +1,8 @@
 // Package lifecycletest helps test code built on lifecycle: it checks that a
 // scope tree is empty, finds leaked goroutines from runtime stack dumps, and
-// runs the standard start, close and verify cycle.
+// runs the standard start, close and verify cycle. Where the runtime has the
+// goroutineleak profile, leak reports add it: it marks the goroutines blocked
+// forever on something no running goroutine can reach.
 package lifecycletest
 
 import (
@@ -9,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"slices"
 	"strconv"
 	"strings"
@@ -125,6 +128,25 @@ func format(leaked []Goroutine) string {
 	for _, g := range leaked {
 		b.WriteString("\n\n")
 		b.WriteString(g.Stack)
+	}
+	if p := leakProfile(); p != "" {
+		b.WriteString("\n\n")
+		b.WriteString(p)
+	}
+	return b.String()
+}
+
+// leakProfile returns the goroutineleak profile when it lists goroutines,
+// else "". Taking it runs a garbage collection. Runtimes without the profile
+// return "".
+func leakProfile() string {
+	p := pprof.Lookup("goroutineleak")
+	if p == nil {
+		return ""
+	}
+	var b bytes.Buffer
+	if err := p.WriteTo(&b, 1); err != nil || strings.HasPrefix(b.String(), "goroutineleak profile: total 0\n") {
+		return ""
 	}
 	return b.String()
 }
