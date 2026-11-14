@@ -20,6 +20,15 @@ var (
 	ErrGoexit = errors.New("lifecycle: task called runtime.Goexit")
 
 	errNilCloser = errors.New("lifecycle: nil io.Closer")
+
+	errLatestCapacity    = errors.New("lifecycle: KeyedLatest capacity must be positive")
+	errLatestFull        = errors.New("lifecycle: KeyedLatest full policy not set")
+	errLatestOnDrop      = errors.New("lifecycle: DropOldest KeyedLatest needs OnDrop")
+	errBlockTimeout      = errors.New("lifecycle: BlockTimeout must be zero or positive and is only used by Block")
+	errQueueCapacity     = errors.New("lifecycle: queue capacity must be positive")
+	errQueueFull         = errors.New("lifecycle: queue full policy not set")
+	errQueueOnDrop       = errors.New("lifecycle: DropOldest queue needs OnDrop")
+	errQueueOnDropUnused = errors.New("lifecycle: OnDrop is only used by DropOldest")
 )
 
 // TaskError is the error of a named task or child scope.

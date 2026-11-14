@@ -89,7 +89,7 @@ type Scope struct {
 	name     string
 	parent   *Scope
 	policy   Policy
-	ctx      context.Context
+	ctx      context.Context //nolint:containedctx // the scope is the context's owner; tasks and resources run under it
 	cancel   context.CancelCauseFunc
 	finished chan struct{}
 
@@ -123,8 +123,8 @@ type resource struct {
 // detachedCtx keeps the values and the deadline of the parent context but
 // not its cancellation, which reaches the scope through Close.
 type detachedCtx struct {
-	context.Context
-	parent context.Context
+	context.Context                 //nolint:containedctx // wrapper type: it is a context that adjusts the deadline
+	parent          context.Context //nolint:containedctx // only the deadline is read from it
 }
 
 func (c detachedCtx) Deadline() (time.Time, bool) { return c.parent.Deadline() }
@@ -137,7 +137,7 @@ func New(ctx context.Context, policy Policy) *Scope {
 	if ctx == nil {
 		panic("lifecycle: nil Context")
 	}
-	s := newScope("", nil, policy, detachedCtx{context.WithoutCancel(ctx), ctx})
+	s := newScope(detachedCtx{context.WithoutCancel(ctx), ctx}, "", nil, policy) //nolint:contextcheck // the root scope owns its context; the cancellation of ctx reaches it through AfterFunc
 	if ctx.Err() != nil {
 		s.Close(context.Cause(ctx))
 		return s
@@ -155,7 +155,7 @@ func New(ctx context.Context, policy Policy) *Scope {
 	return s
 }
 
-func newScope(name string, parent *Scope, policy Policy, base context.Context) *Scope {
+func newScope(base context.Context, name string, parent *Scope, policy Policy) *Scope {
 	if !policy.valid() {
 		panic("lifecycle: invalid Policy")
 	}
@@ -170,7 +170,7 @@ func newScope(name string, parent *Scope, policy Policy, base context.Context) *
 // has [Policy.Propagate]. Child panics if policy is the zero Policy and
 // returns ErrClosed if s is closed.
 func (s *Scope) Child(name string, policy Policy) (*Scope, error) {
-	k := newScope(name, s, policy, s.ctx)
+	k := newScope(s.ctx, name, s, policy)
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -262,20 +262,20 @@ func (s *Scope) run(name string, fn func(context.Context) error) {
 		s.tasks--
 		s.settle()
 	}()
-	err, panicked := call(s.ctx, fn)
+	panicked, err := call(s.ctx, fn)
 	returned = true
 	if err != nil {
 		s.report(&TaskError{Name: name, Err: err}, !panicked)
 	}
 }
 
-func call(ctx context.Context, fn func(context.Context) error) (err error, panicked bool) {
+func call(ctx context.Context, fn func(context.Context) error) (panicked bool, err error) {
 	defer func() {
 		if v := recover(); v != nil {
-			err, panicked = &PanicError{Value: v, Stack: debug.Stack()}, true
+			panicked, err = true, &PanicError{Value: v, Stack: debug.Stack()}
 		}
 	}()
-	return fn(ctx), false
+	return false, fn(ctx)
 }
 
 // report applies the policy to a task or child error. A filterable error
@@ -442,7 +442,7 @@ func (s *Scope) closeResources(kids []*Scope, last *resource) {
 	}
 }
 
-var closedChan = func() chan struct{} {
+var closedChan = func() chan struct{} { //nolint:gochecknoglobals // read-only closed channel shared by every scope that needs one
 	c := make(chan struct{})
 	close(c)
 	return c

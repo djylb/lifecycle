@@ -318,6 +318,7 @@ func FuzzKeyedLatest(f *testing.F) {
 }
 
 func keyedModel(t *testing.T, ops []byte) {
+	t.Helper()
 	if len(ops) < 2 {
 		return
 	}

@@ -18,7 +18,7 @@ func TestStandardLibraryOnly(t *testing.T) {
 		t.Skip("no go command")
 	}
 	const module = "github.com/djylb/lifecycle"
-	out, err := exec.Command(goCmd, "list", "-deps", "-test", "-f", "{{.ImportPath}} {{.Standard}}", module+"/...").Output()
+	out, err := exec.CommandContext(t.Context(), goCmd, "list", "-deps", "-test", "-f", "{{.ImportPath}} {{.Standard}}", module+"/...").Output()
 	if err != nil {
 		t.Fatalf("go list: %v", err)
 	}

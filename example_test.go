@@ -49,7 +49,7 @@ func ExampleScope_Child() {
 	if _, err := conn.Add(resource("conn-1 socket")); err != nil {
 		panic(err)
 	}
-	_ = conn.Go("read", func(ctx context.Context) error { return io.ErrUnexpectedEOF })
+	_ = conn.Go("read", func(context.Context) error { return io.ErrUnexpectedEOF })
 
 	<-conn.Finished() // the connection failed alone; root stays open
 

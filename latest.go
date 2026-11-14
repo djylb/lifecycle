@@ -251,13 +251,13 @@ type KeyedLatest[K comparable, T any] struct {
 func NewKeyedLatest[K comparable, T any](cfg KeyedLatestConfig[K, T]) (*KeyedLatest[K, T], error) {
 	switch {
 	case cfg.Capacity <= 0:
-		return nil, errors.New("lifecycle: KeyedLatest capacity must be positive")
+		return nil, errLatestCapacity
 	case cfg.Full < Reject || cfg.Full > Block:
-		return nil, errors.New("lifecycle: KeyedLatest full policy not set")
+		return nil, errLatestFull
 	case cfg.Full == DropOldest && cfg.OnDrop == nil:
-		return nil, errors.New("lifecycle: DropOldest KeyedLatest needs OnDrop")
+		return nil, errLatestOnDrop
 	case cfg.BlockTimeout < 0, cfg.Full != Block && cfg.BlockTimeout != 0:
-		return nil, errors.New("lifecycle: BlockTimeout must be zero or positive and is only used by Block")
+		return nil, errBlockTimeout
 	}
 	return &KeyedLatest[K, T]{
 		ring:    make([]keyedEntry[K, T], cfg.Capacity),

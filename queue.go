@@ -104,15 +104,15 @@ type Queue[T any] struct {
 func NewQueue[T any](cfg QueueConfig[T]) (*Queue[T], error) {
 	switch {
 	case cfg.Capacity <= 0:
-		return nil, errors.New("lifecycle: queue capacity must be positive")
+		return nil, errQueueCapacity
 	case cfg.Full < Reject || cfg.Full > Block:
-		return nil, errors.New("lifecycle: queue full policy not set")
+		return nil, errQueueFull
 	case cfg.Full == DropOldest && cfg.OnDrop == nil:
-		return nil, errors.New("lifecycle: DropOldest queue needs OnDrop")
+		return nil, errQueueOnDrop
 	case cfg.Full != DropOldest && cfg.OnDrop != nil:
-		return nil, errors.New("lifecycle: OnDrop is only used by DropOldest")
+		return nil, errQueueOnDropUnused
 	case cfg.BlockTimeout < 0, cfg.Full != Block && cfg.BlockTimeout != 0:
-		return nil, errors.New("lifecycle: BlockTimeout must be zero or positive and is only used by Block")
+		return nil, errBlockTimeout
 	}
 	return &Queue[T]{
 		items:   make(chan T, cfg.Capacity),

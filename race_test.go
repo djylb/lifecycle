@@ -21,6 +21,7 @@ func (c *countCloser) Close() error { c.n.Add(1); return nil }
 // joined, a resource handed to Add is closed exactly once unless it was
 // removed, and the tree ends empty.
 func race(t *testing.T, ops []byte, closeAfter int) {
+	t.Helper()
 	root := lifecycle.New(context.Background(), lifecycle.Isolate(func(error) {}))
 	scopes := []*lifecycle.Scope{root}
 	var smu sync.Mutex

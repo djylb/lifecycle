@@ -35,7 +35,7 @@ type Goroutine struct {
 func (g Goroutine) String() string { return g.Stack }
 
 // alwaysIgnored match goroutines of the runtime and the testing package.
-var alwaysIgnored = []string{
+var alwaysIgnored = []string{ //nolint:gochecknoglobals // read-only table
 	"testing.(*M).",
 	"testing.tRunner(",
 	"testing.runTests",

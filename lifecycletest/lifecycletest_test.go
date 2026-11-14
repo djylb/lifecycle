@@ -91,7 +91,7 @@ func TestRunCycle(t *testing.T) {
 	r := &recorder{TB: t}
 	stop := make(chan struct{})
 	defer close(stop)
-	err = lifecycletest.RunCycle(r, 20*time.Millisecond, func(s *lifecycle.Scope) error {
+	err = lifecycletest.RunCycle(r, 20*time.Millisecond, func(*lifecycle.Scope) error {
 		go func() { <-stop }()
 		return nil
 	})

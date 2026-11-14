@@ -1,0 +1,80 @@
+version: "2"
+
+linters:
+  default: all
+  disable:
+    # Formatting and naming style that gofmt and the code's idiom already
+    # settle: blank-line placement, short names in short scopes, the
+    # if err := f(); err != nil form, embedded-field spacing.
+    - wsl
+    - wsl_v5
+    - nlreturn
+    - varnamelen
+    - noinlineerr
+    - embeddedstructfieldcheck
+    - lll
+    # Zero values are ready to use; literals name only the fields they set.
+    - exhaustruct
+    - exhaustruct_v5
+    # Methods are ordered by topic, next to the code they serve.
+    - funcorder
+    # Deprecated, replaced by gomodguard_v2.
+    - gomodguard
+    # The lock-protected paths are written out in one function on purpose,
+    # so that the fast path stays free of calls; size metrics flag exactly
+    # those, and the long tests spell out their steps.
+    - cyclop
+    - gocognit
+    - funlen
+    # The tests share the test binary's goroutine accounting (leak check in
+    # TestMain), so they run one after another.
+    - paralleltest
+    - tparallel
+    # Context errors are returned as they are, so that callers can match
+    # them with errors.Is; Close and Wait results are the caller's own.
+    - wrapcheck
+    # Pop and TryPop return the zero value of the element type next to an
+    # error or false; this is not an interface return.
+    - ireturn
+    # Named results document what a function returns.
+    - nonamedreturns
+    # Sizes and shifts are explained where they are used.
+    - mnd
+    # No import rules: the module has no dependencies.
+    - depguard
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        # Checked on its own, as fieldalignment; what remains are
+        # pointer-byte reports, for which fields keep their order of
+        # meaning.
+        - fieldalignment
+    exhaustive:
+      default-signifies-exhaustive: true
+    thelper:
+      tb:
+        # The helpers take the same t as the tests do.
+        name: false
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+  exclusions:
+    rules:
+      # Tests build errors in place, assert on values they just stored,
+      # print from examples, and run the go tool by name; the
+      # conversions are of generated values that fit.
+      - path: _test\.go
+        linters:
+          - err113
+          - forcetypeassert
+          - forbidigo
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G115|G204"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -548,8 +548,8 @@ func TestRun(t *testing.T) {
 	if !errors.As(err, &te) || te.Name != "failer" || !errors.Is(err, boom) {
 		t.Fatalf("first error %v", err)
 	}
-	if err := lifecycle.Run(ctx, func(*lifecycle.Scope) error { return boom }); !errors.Is(err, boom) {
-		t.Fatalf("fn error %v", err)
+	if err2 := lifecycle.Run(ctx, func(*lifecycle.Scope) error { return boom }); !errors.Is(err2, boom) {
+		t.Fatalf("fn error %v", err2)
 	}
 
 	cctx, cancel := context.WithCancelCause(ctx)
@@ -584,7 +584,8 @@ func TestInvalidPolicy(t *testing.T) {
 	for name, fn := range map[string]func(){
 		"zero":        func() { lifecycle.New(context.Background(), lifecycle.Policy{}) },
 		"nil handler": func() { lifecycle.New(context.Background(), lifecycle.Isolate(nil)) },
-		"nil context": func() { lifecycle.New(nil, lifecycle.CancelOnError()) }, //nolint:staticcheck
+		//lint:ignore SA1012 the nil context is what is tested
+		"nil context": func() { lifecycle.New(nil, lifecycle.CancelOnError()) }, //nolint:staticcheck // SA1012: the nil context is what is tested
 	} {
 		func() {
 			defer func() {
