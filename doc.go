@@ -35,7 +35,9 @@
 //
 //   - Go, Add and Child are linearised with Close by the scope's mutex: a
 //     task, resource or child is either registered before Close and then
-//     joined or closed by it, or refused with [ErrClosed].
+//     joined or closed by it, or refused with [ErrClosed]. A scope on which
+//     Go and Child keep colliding spreads them over lock shards that it
+//     grows on demand; Close takes every shard, so the guarantee holds.
 //   - When Close returns, the scope and all its descendants are closed and
 //     their contexts are cancelled. A scope's context is cancelled only by
 //     Close, so Done is closed exactly when Go starts to fail.

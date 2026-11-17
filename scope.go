@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -86,32 +88,181 @@ type Stats struct {
 // New, or once idle after CloseWhenIdle; it is never closed just because its
 // tasks returned.
 type Scope struct {
-	name     string
-	parent   *Scope
-	policy   Policy
 	ctx      context.Context //nolint:containedctx // the scope is the context's owner; tasks and resources run under it
+	parent   *Scope
 	cancel   context.CancelCauseFunc
 	finished chan struct{}
-
-	mu       sync.Mutex
-	stop     func() bool // unregisters the parent context's AfterFunc
-	closed   bool
-	closing  bool // the closer goroutine is running
-	idle     bool // close once no task and no child is left
-	done     bool
-	cause    error
+	// shards is nil until Go or Child observe contention on mu; from then
+	// on new tasks and children register on a shard. See shard.
+	shards   atomic.Pointer[[]*shard]
+	slot     *shard // the parent's shard this scope is registered on, or nil
+	name     string
+	stop     func() bool // unregisters the parent context's AfterFunc; guarded by mu
+	cause    error       // guarded by mu, like the fields below
 	result   error
 	first    error // first error of the result
-	errs     []error
-	tasks    int
-	nres     int
 	resHead  *resource
 	resTail  *resource
-	nkids    int
 	kidsHead *Scope
-	sibPrev  *Scope // guarded by parent.mu
-	sibNext  *Scope // guarded by parent.mu
+	sibPrev  *Scope // guarded by parent.mu, or by slot.mu when slot != nil
+	sibNext  *Scope // guarded by parent.mu, or by slot.mu when slot != nil
 	closersC chan struct{}
+	policy   Policy
+	errs     []error // guarded by mu
+
+	mu      sync.Mutex
+	tasks   int
+	nres    int
+	nkids   int
+	pending int         // tasks and children on shards when the scope closed, not yet ended
+	idleA   atomic.Bool // idle, readable without mu by sharded task ends
+	misses  uint32      // collision window of mu, see lockCounted
+	closed  bool
+	closing bool // the closer goroutine is running
+	idle    bool // close once no task and no child is left
+	done    bool
+}
+
+// A shard holds part of a busy scope's tasks and children under its own
+// mutex. A scope starts with none, so a small scope pays one nil pointer;
+// the first shards are made when registrations on the scope's mutex keep
+// colliding, and their number doubles when a shard's own mutex keeps
+// colliding. Shards are never moved or removed, so a count stays on the
+// shard it was made on. Lock order: Scope.mu before shard.mu.
+//
+// While the scope is open the shard's counts are its own. Close marks every
+// shard closed under both mutexes and moves the counts into Scope.pending;
+// a task or child that ends on a closed shard then decrements pending
+// under Scope.mu.
+type shard struct {
+	kidsHead *Scope
+	tasks    int
+	nkids    int
+	mu       sync.Mutex
+	misses   uint32
+	closed   bool
+	_        [64]byte // keep busy shards on separate cache lines
+}
+
+// A scope, or one of its shards, asks for more shards once growAfter of
+// the last growWindow registrations on its mutex collided, so the number
+// of shards follows the contention actually seen and stops growing when
+// collisions become rare.
+const (
+	growAfter  = 16
+	growWindow = 256
+)
+
+// lockCounted locks mu and reports whether collisions, counted in the low
+// 16 bits of *window and registrations in the high 16 bits, reached
+// growAfter within growWindow registrations; it then starts a new window.
+// *window is guarded by mu.
+func lockCounted(mu *sync.Mutex, window *uint32) bool {
+	missed := !mu.TryLock()
+	if missed {
+		mu.Lock()
+	}
+	w := *window + 1<<16
+	if missed {
+		w++
+	}
+	switch {
+	case w&0xffff >= growAfter:
+		*window = 0
+		return true
+	case w>>16 >= growWindow:
+		*window = 0
+	default:
+		*window = w
+	}
+	return false
+}
+
+// grow doubles the shards of s, unless another call already grew past
+// have shards or s is closed. It runs with s.mu held.
+func (s *Scope) growLocked(have int) {
+	if s.closed {
+		return
+	}
+	cur := s.shards.Load()
+	if cur != nil && len(*cur) != have {
+		return
+	}
+	next := make([]*shard, max(2, 2*have))
+	if cur != nil {
+		copy(next, *cur)
+	}
+	for i := have; i < len(next); i++ {
+		next[i] = &shard{}
+	}
+	s.shards.Store(&next)
+}
+
+// pickShard returns a shard of s, or nil while s has none. The runtime's
+// generator keeps no state shared between callers.
+func (s *Scope) pickShard() *shard {
+	sh := s.shards.Load()
+	if sh == nil {
+		return nil
+	}
+	return (*sh)[rand.IntN(len(*sh))] //nolint:gosec // load spreading, not security
+}
+
+// lockShard locks sd, growing the shards of s if sd keeps colliding.
+func (s *Scope) lockShard(sd *shard) {
+	if lockCounted(&sd.mu, &sd.misses) {
+		sd.mu.Unlock()
+		s.mu.Lock()
+		s.growLocked(len(*s.shards.Load()))
+		s.mu.Unlock()
+		sd.mu.Lock()
+	}
+}
+
+// lockBase locks s.mu for a registration, making the first shards if it
+// keeps colliding. It reports whether shards exist now, in which case the
+// caller unlocks and registers on a shard instead.
+func (s *Scope) lockBase() bool {
+	if lockCounted(&s.mu, &s.misses) {
+		s.growLocked(0)
+	}
+	return s.shards.Load() != nil
+}
+
+// shardEnded finishes the end of a task or child on sd: sd.mu is held and
+// the count already decremented; it unlocks.
+func (s *Scope) shardEnded(sd *shard) {
+	closed := sd.closed
+	sd.mu.Unlock()
+	switch {
+	case closed:
+		s.mu.Lock()
+		s.pending--
+		s.settle()
+	case s.idleA.Load():
+		s.mu.Lock()
+		s.settle()
+	}
+}
+
+// shardsEmptyLocked reports, with s.mu held, whether no task or child is
+// registered on any shard. It holds every shard's mutex at once, so the
+// answer is a consistent snapshot: a task that starts another before it
+// ends is never missed.
+func (s *Scope) shardsEmptyLocked() bool {
+	sh := s.shards.Load()
+	if sh == nil {
+		return true
+	}
+	n := 0
+	for _, sd := range *sh {
+		sd.mu.Lock()
+		n += sd.tasks + sd.nkids
+	}
+	for _, sd := range *sh {
+		sd.mu.Unlock()
+	}
+	return n == 0
 }
 
 type resource struct {
@@ -128,6 +279,16 @@ type detachedCtx struct {
 }
 
 func (c detachedCtx) Deadline() (time.Time, bool) { return c.parent.Deadline() }
+
+// uncancelled is a child scope's base context: the values and the deadline
+// of the parent scope's context without its cancellation, which reaches the
+// child through Close. Unlike context.WithoutCancel it keeps the deadline.
+type uncancelled struct {
+	context.Context //nolint:containedctx // wrapper type: it is a context that hides the cancellation
+}
+
+func (uncancelled) Done() <-chan struct{} { return nil }
+func (uncancelled) Err() error            { return nil }
 
 // New returns a root scope. Its context carries the values and the deadline
 // of ctx, and the cancellation of ctx closes the scope with
@@ -170,8 +331,17 @@ func newScope(base context.Context, name string, parent *Scope, policy Policy) *
 // has [Policy.Propagate]. Child panics if policy is the zero Policy and
 // returns ErrClosed if s is closed.
 func (s *Scope) Child(name string, policy Policy) (*Scope, error) {
-	k := newScope(s.ctx, name, s, policy)
-	s.mu.Lock()
+	// The child's context does not register with s's: Close closes the
+	// children before cancelling s, so registration would only serialise
+	// every Child on s's context.
+	k := newScope(uncancelled{s.ctx}, name, s, policy)
+	if sd := s.pickShard(); sd != nil {
+		return s.childAdd(sd, k)
+	}
+	if s.lockBase() {
+		s.mu.Unlock()
+		return s.childAdd(s.pickShard(), k)
+	}
 	if s.closed {
 		s.mu.Unlock()
 		k.cancel(ErrClosed)
@@ -185,6 +355,31 @@ func (s *Scope) Child(name string, policy Policy) (*Scope, error) {
 	s.nkids++
 	s.mu.Unlock()
 	return k, nil
+}
+
+func (s *Scope) childAdd(sd *shard, k *Scope) (*Scope, error) {
+	if err := s.childOn(sd, k); err != nil {
+		return nil, err
+	}
+	return k, nil
+}
+
+func (s *Scope) childOn(sd *shard, k *Scope) error {
+	s.lockShard(sd)
+	if sd.closed {
+		sd.mu.Unlock()
+		k.cancel(ErrClosed)
+		return ErrClosed
+	}
+	k.slot = sd
+	k.sibNext = sd.kidsHead
+	if sd.kidsHead != nil {
+		sd.kidsHead.sibPrev = k
+	}
+	sd.kidsHead = k
+	sd.nkids++
+	sd.mu.Unlock()
+	return nil
 }
 
 // Name returns the name given to Child, or "" for a root scope.
@@ -241,22 +436,43 @@ func (s *Scope) Finished() <-chan struct{} { return s.finished }
 // the task in errors. fn's error and any panic are handled by the scope's
 // policy. Go returns ErrClosed, without running fn, if the scope is closed.
 func (s *Scope) Go(name string, fn func(ctx context.Context) error) error {
-	s.mu.Lock()
-	if s.closed {
+	sd := s.pickShard()
+	if sd == nil {
+		if !s.lockBase() {
+			if s.closed {
+				s.mu.Unlock()
+				return ErrClosed
+			}
+			s.tasks++
+			s.mu.Unlock()
+			go s.run(nil, name, fn)
+			return nil
+		}
 		s.mu.Unlock()
+		sd = s.pickShard()
+	}
+	s.lockShard(sd)
+	if sd.closed {
+		sd.mu.Unlock()
 		return ErrClosed
 	}
-	s.tasks++
-	s.mu.Unlock()
-	go s.run(name, fn)
+	sd.tasks++
+	sd.mu.Unlock()
+	go s.run(sd, name, fn)
 	return nil
 }
 
-func (s *Scope) run(name string, fn func(context.Context) error) {
+func (s *Scope) run(sd *shard, name string, fn func(context.Context) error) {
 	returned := false
 	defer func() {
 		if !returned { // runtime.Goexit
 			s.report(&TaskError{Name: name, Err: ErrGoexit}, false)
+		}
+		if sd != nil {
+			sd.mu.Lock()
+			sd.tasks--
+			s.shardEnded(sd)
+			return
 		}
 		s.mu.Lock()
 		s.tasks--
@@ -392,6 +608,17 @@ func (s *Scope) closeLocked(cause error) bool {
 			kids = append(kids, k)
 		}
 	}
+	if sh := s.shards.Load(); sh != nil {
+		for _, sd := range *sh {
+			sd.mu.Lock()
+			sd.closed = true
+			s.pending += sd.tasks + sd.nkids
+			for k := sd.kidsHead; k != nil; k = k.sibNext {
+				kids = append(kids, k)
+			}
+			sd.mu.Unlock()
+		}
+	}
 	last := s.resTail
 	s.resHead, s.resTail, s.nres = nil, nil, 0
 	needCloser := kids != nil || last != nil
@@ -472,6 +699,7 @@ func (s *Scope) CloseWhenIdle() {
 		return
 	}
 	s.idle = true
+	s.idleA.Store(true)
 	s.settle()
 }
 
@@ -479,7 +707,7 @@ func (s *Scope) CloseWhenIdle() {
 // CloseWhenIdle, and unlocks: it closes an idle scope or finishes a
 // drained one.
 func (s *Scope) settle() {
-	if s.idle && !s.closed && s.tasks == 0 && s.nkids == 0 {
+	if s.idle && !s.closed && s.tasks == 0 && s.nkids == 0 && s.shardsEmptyLocked() {
 		s.closeLocked(nil)
 		return
 	}
@@ -493,7 +721,7 @@ func (s *Scope) settle() {
 // finishableLocked reports, once, that the scope has just finished, and
 // records its result.
 func (s *Scope) finishableLocked() bool {
-	if !s.closed || s.done || s.closing || s.tasks > 0 || s.nkids > 0 {
+	if !s.closed || s.done || s.closing || s.tasks > 0 || s.nkids > 0 || s.pending > 0 {
 		return false
 	}
 	s.done = true
@@ -516,6 +744,21 @@ func (s *Scope) childFinished(k *Scope) {
 	if res := k.result; res != nil && k.policy.propagate { // immutable once done
 		s.report(&TaskError{Name: k.name, Err: res}, false)
 	}
+	if sd := k.slot; sd != nil {
+		sd.mu.Lock()
+		if k.sibPrev != nil {
+			k.sibPrev.sibNext = k.sibNext
+		} else {
+			sd.kidsHead = k.sibNext
+		}
+		if k.sibNext != nil {
+			k.sibNext.sibPrev = k.sibPrev
+		}
+		k.sibPrev, k.sibNext = nil, nil
+		sd.nkids--
+		s.shardEnded(sd)
+		return
+	}
 	s.mu.Lock()
 	if k.sibPrev != nil {
 		k.sibPrev.sibNext = k.sibNext
@@ -530,13 +773,28 @@ func (s *Scope) childFinished(k *Scope) {
 	s.settle()
 }
 
-// Stats returns the counts of the scope and its descendants.
+// Stats returns the counts of the scope and its descendants. It visits the
+// whole subtree, locking one scope at a time, so its cost grows with the
+// number of descendants: use it for diagnostics, not on a hot path. The
+// totals are not kept incrementally because that would make every Go,
+// Child and Add update every ancestor, contending on the root.
 func (s *Scope) Stats() Stats {
 	s.mu.Lock()
 	st := Stats{Tasks: s.tasks, Resources: s.nres, Scopes: s.nkids, Closed: s.closed, Finished: s.done}
 	var kids []*Scope
 	for k := s.kidsHead; k != nil; k = k.sibNext {
 		kids = append(kids, k)
+	}
+	if sh := s.shards.Load(); sh != nil {
+		for _, sd := range *sh {
+			sd.mu.Lock()
+			st.Tasks += sd.tasks
+			st.Scopes += sd.nkids
+			for k := sd.kidsHead; k != nil; k = k.sibNext {
+				kids = append(kids, k)
+			}
+			sd.mu.Unlock()
+		}
 	}
 	s.mu.Unlock()
 	for _, k := range kids {
