@@ -201,11 +201,18 @@ func (s *Scope) growLocked(have int) {
 // pickShard returns a shard of s, or nil while s has none. The runtime's
 // generator keeps no state shared between callers.
 func (s *Scope) pickShard() *shard {
-	sh := s.shards.Load()
-	if sh == nil {
-		return nil
+	if sh := s.shards.Load(); sh != nil {
+		return pickOf(*sh)
 	}
-	return (*sh)[rand.IntN(len(*sh))] //nolint:gosec // load spreading, not security
+	return nil
+}
+
+// grownShard returns a shard of s, which must already have shards, as it
+// does once lockBase has reported true.
+func (s *Scope) grownShard() *shard { return pickOf(*s.shards.Load()) }
+
+func pickOf(shards []*shard) *shard {
+	return shards[rand.IntN(len(shards))] //nolint:gosec // load spreading, not security
 }
 
 // lockShard locks sd, growing the shards of s if sd keeps colliding.
@@ -340,7 +347,7 @@ func (s *Scope) Child(name string, policy Policy) (*Scope, error) {
 	}
 	if s.lockBase() {
 		s.mu.Unlock()
-		return s.childAdd(s.pickShard(), k)
+		return s.childAdd(s.grownShard(), k)
 	}
 	if s.closed {
 		s.mu.Unlock()
@@ -449,7 +456,7 @@ func (s *Scope) Go(name string, fn func(ctx context.Context) error) error {
 			return nil
 		}
 		s.mu.Unlock()
-		sd = s.pickShard()
+		sd = s.grownShard()
 	}
 	s.lockShard(sd)
 	if sd.closed {
