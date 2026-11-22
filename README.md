@@ -7,6 +7,7 @@ behaviour when full is chosen up front, and newest-value-wins mailboxes.
 - Standard library only, tests included.
 - Every goroutine started with `Go` is joined; panics become errors with
   the task name and stack.
+- `Enter` joins work in a caller-managed goroutine, such as a callback.
 - `Close` never blocks and runs no user code; `Wait` is bounded by a
   context.
 - No background goroutines: the package starts only the task goroutines,
@@ -65,11 +66,11 @@ Policies are refined with two options:
 - `.Propagate()` on a child's policy hands the child's result, when it
   finishes with an error, to the parent's policy like a task error.
   Without it a child's errors stay in the child.
-- `.Expected(fn)` decides which errors are a normal exit once the scope is
-  closing. The default, `IsExpectedExit`, accepts `context.Canceled`,
-  `ErrClosed`, `ErrQueueClosed` and `net.ErrClosed`; an error matching the
-  close cause is always expected. Expected errors are not reported; panics
-  always are.
+- `.Expected(fn)` decides which errors are a normal exit after the scope's
+  context is cancelled. The default accepts `context.Canceled`, `ErrClosed`,
+  `ErrQueueClosed` and `net.ErrClosed`. An error matching the cancellation
+  cause is also expected. During a live drain, only errors matching
+  `ErrClosed` are expected. Panics from `Go` are always reported.
 
 For a batch of work, `Run` waits for every task, then closes the scope and
 returns the first error:
@@ -84,17 +85,67 @@ err := lifecycle.Run(ctx, func(s *lifecycle.Scope) error {
 ```
 
 `CloseWhenIdle` is the same behaviour for any scope: it closes once no task
-and no child is left.
+and no child is left. Until then, `Go`, `Child` and `Enter` still admit work.
+Each child controls its own lifetime, so a batch can wait for children
+that are still accepting work.
+
+Use `Enter` for a callback running in a goroutine owned by its caller:
+
+```go
+func onEvent(s *lifecycle.Scope) {
+	task, err := s.Enter()
+	if err != nil {
+		return // shutdown has stopped admissions
+	}
+	defer task.End()
+	processEvent(s.Context())
+}
+```
+
+`Enter` and `End` use the same task counts as `Go`. Registration and completion
+themselves allocate no per-task memory. A `*Task` may escape to the heap when
+handed off, and shard growth and shutdown can allocate. Pass a pointer to the
+recipient and have it call `End`. The `go vet` copylocks check flags copies
+of a `Task`. Repeating `End` on the same handle is safe, including from
+multiple goroutines. The final `End` can cancel the scope's context and start
+resource cleanup. The callback handles its own errors and panics. If a panic
+leaves a task without a deferred `End` or an owner to end it, the scope
+cannot finish.
+
+`Drain` walks the subtree and stops `Go`, `Child` and `Enter` with `ErrClosed`
+one scope at a time. Descendants can admit work until reached, and the entire
+subtree is sealed when `Drain` returns. Each scope closes once its admitted
+tasks and children finish. Admitted work keeps its context live and can still
+use `Add`. `Draining()` signals each scope's admission cutoff during `Drain`
+or `Close`. `Done()` signals context cancellation. `Stats().Draining` is
+true during the graceful phase. The following shutdown waits up to a grace
+period, then cancels outstanding work and waits a bounded time for cleanup.
+
+```go
+s.Drain()
+graceCtx, cancelGrace := context.WithTimeout(context.Background(), gracePeriod)
+defer cancelGrace()
+err := s.Wait(graceCtx)
+if errors.Is(err, lifecycle.ErrNotFinished) {
+	s.Close(context.DeadlineExceeded)
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancelCleanup()
+	err = s.Wait(cleanupCtx)
+}
+return err
+```
 
 Closing a scope:
 
-- marks it and its whole subtree closed and cancels their contexts before
-  `Close` returns; from then on `Go`, `Add` and `Child` return `ErrClosed`;
+- seals the subtree so `Go`, `Enter`, `Add` and `Child` return `ErrClosed`.
+  `Close` cancels the contexts it starts closing before it returns. With
+  concurrent `Close` calls, use `<-s.Done()` to observe cancellation of a
+  particular scope already being closed by another call;
 - closes resources in reverse order of `Add`, children's resources before
   the parent's; errors and panics of `Close` methods are joined into the
   result;
 - does not wait for tasks: `Wait` does, and returns once every task of the
-  subtree has returned and every resource is closed.
+  subtree has ended and every resource is closed.
 
 `Add` on a closed scope closes the resource at once and returns
 `ErrClosed`, so a resource handed to a scope is never leaked. `Add` also
@@ -149,10 +200,13 @@ Keys come out in the order they became pending; a `Set` on a pending key
 replaces its value in place without moving it and never hits the full
 policy, which applies only to new keys. `OnDrop` receives every value that
 is overwritten or evicted before it was taken (required with
-`DropOldest`), outside any lock. `Close`, `Drain`, `Stats`, `ErrFull` and
-`ErrQueueClosed` behave as for `Queue`. `Set`, `Wait` and `Pop` do not
-allocate, apart from the timer of a `Block` set that has to wait with a
-`BlockTimeout`.
+`DropOldest`), outside any lock. `TakePending(fn)` consumes pending values,
+passing them to `fn` when provided and returning how many it took. `Latest`
+takes at most one value, and `KeyedLatest` takes keys in `TryPop` order until
+the mailbox is empty. Both can take pending values after `Close`.
+`Close`, `Stats`, `ErrFull` and `ErrQueueClosed` behave as for `Queue`.
+`Set`, `Wait` and `Pop` do not allocate, apart from the timer of a `Block`
+set that has to wait with a `BlockTimeout`.
 
 ## lifecycletest
 

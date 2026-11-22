@@ -104,8 +104,8 @@ func TestLatestWaitWakesAndClose(t *testing.T) {
 	if v, _, err := l2.Wait(context.Background()); v != 1 || err != nil {
 		t.Fatalf("pending after close: %d %v", v, err)
 	}
-	if n := l2.Drain(nil); n != 0 {
-		t.Fatalf("drain %d", n)
+	if n := l2.TakePending(nil); n != 0 {
+		t.Fatalf("TakePending took %d values", n)
 	}
 }
 
@@ -117,7 +117,7 @@ func TestZeroLatest(t *testing.T) {
 	if _, _, err := l.Wait(context.Background()); err == nil {
 		t.Fatal("zero Wait ok")
 	}
-	if _, _, ok := l.TryGet(); ok || l.Drain(nil) != 0 || l.Stats() != (lifecycle.LatestStats{}) {
+	if _, _, ok := l.TryGet(); ok || l.TakePending(nil) != 0 || l.Stats() != (lifecycle.LatestStats{}) {
 		t.Fatal("zero Latest not empty")
 	}
 	mustCloseC(t, &l)
@@ -179,7 +179,7 @@ func TestKeyedLatestOrderAndOverwrite(t *testing.T) {
 		t.Fatalf("pending key on full: %v", err)
 	}
 	var got []kv
-	q.Drain(func(k, v int) { got = append(got, kv{k, v}) })
+	q.TakePending(func(k, v int) { got = append(got, kv{k, v}) })
 	if !slices.Equal(got, []kv{{1, 11}, {2, 21}, {3, 31}}) || !slices.Equal(dropped, []kv{{1, 10}, {2, 20}, {3, 30}}) {
 		t.Fatalf("got %v dropped %v", got, dropped)
 	}
@@ -240,8 +240,8 @@ func TestKeyedLatestBlock(t *testing.T) {
 		}
 	}
 	mustCloseC(t, q2)
-	if q2.Drain(nil) != 1 {
-		t.Fatal("last key not drained")
+	if q2.TakePending(nil) != 1 {
+		t.Fatal("TakePending did not take the last key")
 	}
 	if _, _, err := q2.Pop(ctx); !errors.Is(err, lifecycle.ErrQueueClosed) {
 		t.Fatalf("pop after close: %v", err)
@@ -417,7 +417,7 @@ func TestLatestStress(t *testing.T) {
 
 // TestKeyedLatestStress runs concurrent setters and poppers under each
 // policy and checks conservation: every accepted value is popped, dropped
-// or drained exactly once.
+// or taken by TakePending exactly once.
 func TestKeyedLatestStress(t *testing.T) {
 	for _, full := range []lifecycle.FullPolicy{lifecycle.Reject, lifecycle.DropOldest, lifecycle.Block} {
 		t.Run(full.String(), func(t *testing.T) {
@@ -459,9 +459,9 @@ func TestKeyedLatestStress(t *testing.T) {
 			wg.Wait()
 			mustCloseC(t, q)
 			pw.Wait()
-			drained := q.Drain(nil)
-			if total := poppedN.Load() + droppedN.Load() + int64(drained); total != accepted.Load() {
-				t.Fatalf("accepted %d, popped %d dropped %d drained %d", accepted.Load(), poppedN.Load(), droppedN.Load(), drained)
+			taken := q.TakePending(nil)
+			if total := poppedN.Load() + droppedN.Load() + int64(taken); total != accepted.Load() {
+				t.Fatalf("accepted %d, popped %d dropped %d taken %d", accepted.Load(), poppedN.Load(), droppedN.Load(), taken)
 			}
 		})
 	}

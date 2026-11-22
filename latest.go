@@ -46,7 +46,7 @@ type LatestStats struct {
 // value goes to one of them.
 //
 // Close stops new values and wakes every waiter. A value still pending stays
-// available to Wait and TryGet, after which Wait returns ErrQueueClosed.
+// available to Wait, TryGet and TakePending. Once empty, Wait returns ErrQueueClosed.
 // Close implements io.Closer, so a Latest can be added to a [Scope].
 type Latest[T any] struct {
 	mu     sync.Mutex
@@ -146,9 +146,9 @@ func (l *Latest[T]) Wait(ctx context.Context) (v T, missed uint64, err error) {
 	}
 }
 
-// Drain takes the pending value, if any, passes it to fn and returns how
-// many values it took (0 or 1).
-func (l *Latest[T]) Drain(fn func(T)) int {
+// TakePending takes the pending value, if any, and returns how many values
+// it took (0 or 1). It passes the value to fn when fn is non-nil.
+func (l *Latest[T]) TakePending(fn func(T)) int {
 	v, _, ok := l.TryGet()
 	if !ok {
 		return 0
@@ -228,7 +228,7 @@ type keyedEntry[K comparable, T any] struct {
 //
 // Close stops new values and wakes every waiter. Pending keys stay
 // available to Pop and TryPop, after which Pop returns ErrQueueClosed.
-// Drain removes them instead. Close implements io.Closer, so a KeyedLatest
+// TakePending removes them as well. Close implements io.Closer, so a KeyedLatest
 // can be added to a [Scope].
 type KeyedLatest[K comparable, T any] struct {
 	mu      sync.Mutex
@@ -450,9 +450,10 @@ func (q *KeyedLatest[K, T]) TryPop() (k K, v T, ok bool) {
 	return e.key, e.v, ok
 }
 
-// Drain removes every pending key, passes each with its value to fn, and
-// returns how many it removed. Keys set during Drain may be removed too.
-func (q *KeyedLatest[K, T]) Drain(fn func(K, T)) int {
+// TakePending removes keys in TryPop order until none are pending and
+// returns how many it took. It passes each key and value to fn when fn is
+// non-nil. Keys set during the call may be taken too.
+func (q *KeyedLatest[K, T]) TakePending(fn func(K, T)) int {
 	n := 0
 	for {
 		k, v, ok := q.TryPop()

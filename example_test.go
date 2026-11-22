@@ -63,6 +63,40 @@ func ExampleScope_Child() {
 	// <nil>
 }
 
+func ExampleScope_Enter() {
+	s := lifecycle.New(context.Background(), lifecycle.CancelOnError())
+	entered := make(chan struct{})
+	onEvent := func() {
+		task, err := s.Enter()
+		if err != nil {
+			return // no new callbacks during shutdown
+		}
+		defer task.End()
+		close(entered)
+		<-s.Draining()       // the event source can stop accepting work here
+		<-s.Context().Done() // stand-in for work still running at the deadline
+		fmt.Println("callback stopped")
+	}
+	go onEvent() // the event source calls onEvent on its own goroutine
+	<-entered
+
+	s.Drain()
+	graceCtx, cancelGrace := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelGrace()
+	if err := s.Wait(graceCtx); errors.Is(err, lifecycle.ErrNotFinished) {
+		s.Close(context.DeadlineExceeded)
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelCleanup()
+		if err := s.Wait(cleanupCtx); err != nil {
+			panic(err)
+		}
+	}
+	fmt.Println(s.Cause())
+	// Output:
+	// callback stopped
+	// context deadline exceeded
+}
+
 func ExampleRun() {
 	var mu sync.Mutex
 	total := 0
@@ -112,4 +146,17 @@ func ExampleQueue() {
 	// popped b
 	// popped c
 	// lifecycle: queue closed
+}
+
+func ExampleLatest_TakePending() {
+	l := lifecycle.NewLatest(lifecycle.LatestConfig[string]{})
+	if err := l.Set("pending update"); err != nil {
+		panic(err)
+	}
+	_ = l.Close()
+	n := l.TakePending(func(v string) { fmt.Println(v) })
+	fmt.Println(n)
+	// Output:
+	// pending update
+	// 1
 }

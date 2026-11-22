@@ -7,8 +7,9 @@ import (
 )
 
 var (
-	// ErrClosed is returned by Go, Add and Child on a closed scope, and is
-	// the cause recorded by Close(nil).
+	// ErrClosed is returned by Go, Enter, Add and Child on a closed scope,
+	// and by Go, Enter and Child during Drain. It is the cause recorded by
+	// Close(nil).
 	ErrClosed = errors.New("lifecycle: scope closed")
 
 	// ErrNotFinished is wrapped by the error Wait returns when its context

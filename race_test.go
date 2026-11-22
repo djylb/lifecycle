@@ -43,7 +43,7 @@ func race(t *testing.T, ops []byte, closeAfter int) {
 			for i := w; i+1 < len(ops); i += 4 {
 				op, arg := ops[i], ops[i+1]
 				s := pick(arg)
-				switch op % 6 {
+				switch op % 8 {
 				case 0, 1:
 					if s.Go("t", func(ctx context.Context) error {
 						ran.Add(1)
@@ -82,6 +82,12 @@ func race(t *testing.T, ops []byte, closeAfter int) {
 					s.Close(nil)
 				case 5:
 					s.CloseWhenIdle()
+				case 6:
+					if task, err := s.Enter(); err == nil {
+						task.End()
+					}
+				case 7:
+					s.Drain()
 				}
 			}
 		})
@@ -129,6 +135,7 @@ func TestStressCloseRaces(t *testing.T) {
 func FuzzCloseRaces(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 3, 3, 0, 4, 1, 0, 2}, uint8(0))
 	f.Add([]byte{3, 0, 3, 1, 0, 1, 2, 1, 1, 3, 4, 2}, uint8(10))
+	f.Add([]byte{6, 1, 1, 2, 7, 6, 6, 1, 4, 2}, uint8(10))
 	f.Fuzz(func(t *testing.T, ops []byte, closeAfter uint8) {
 		if len(ops) > 4096 {
 			ops = ops[:4096]

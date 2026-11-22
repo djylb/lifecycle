@@ -43,10 +43,10 @@ func Isolate(handler func(err error)) Policy {
 	return Policy{isolate: true, handler: handler}
 }
 
-// Expected returns p with fn deciding which task errors are an expected
-// exit once the scope has started closing; those are not reported. An error
-// matching the close cause is always expected. The default is
-// [IsExpectedExit]; a nil fn restores it.
+// Expected returns p with fn deciding which task errors are expected exits
+// after the scope's context is cancelled. An error matching the cancellation
+// cause is also expected. From the admission cutoff until cancellation, only
+// errors matching [ErrClosed] are expected. A nil fn uses [IsExpectedExit].
 func (p Policy) Expected(fn func(err error) bool) Policy {
 	p.expected = fn
 	return p
@@ -64,8 +64,8 @@ func (p Policy) Propagate() Policy {
 func (p Policy) valid() bool { return p.handler != nil }
 
 // IsExpectedExit reports whether err is the usual way a task ends when its
-// scope closes: it matches context.Canceled, [ErrClosed], [ErrQueueClosed]
-// or net.ErrClosed. It is the default of [Policy.Expected].
+// scope's context is cancelled: it matches context.Canceled, [ErrClosed],
+// [ErrQueueClosed] or net.ErrClosed. It is the default of [Policy.Expected].
 func IsExpectedExit(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, ErrClosed) ||
 		errors.Is(err, ErrQueueClosed) || errors.Is(err, net.ErrClosed)
@@ -78,6 +78,7 @@ type Stats struct {
 	Tasks     int  // running tasks
 	Resources int  // registered resources not yet taken for closing
 	Scopes    int  // descendant scopes that have not finished
+	Draining  bool // this scope is draining before Close starts
 	Closed    bool // this scope has started closing
 	Finished  bool // this scope has finished
 }
@@ -85,43 +86,54 @@ type Stats struct {
 // Scope owns tasks, resources and child scopes. All methods are safe for
 // concurrent use. A Scope must be closed, by Close, by a task error under
 // CancelOnError, by its parent, by the cancellation of the context given to
-// New, or once idle after CloseWhenIdle; it is never closed just because its
-// tasks returned.
+// New, or once idle after CloseWhenIdle or Drain; it is never closed just
+// because its tasks ended.
 type Scope struct {
 	ctx      context.Context //nolint:containedctx // the scope is the context's owner; tasks and resources run under it
 	parent   *Scope
 	cancel   context.CancelCauseFunc
 	finished chan struct{}
-	// shards is nil until Go or Child observe contention on mu; from then
-	// on new tasks and children register on a shard. See shard.
-	shards   atomic.Pointer[[]*shard]
-	slot     *shard // the parent's shard this scope is registered on, or nil
-	name     string
-	stop     func() bool // unregisters the parent context's AfterFunc; guarded by mu
-	cause    error       // guarded by mu, like the fields below
-	result   error
-	first    error // first error of the result
-	resHead  *resource
-	resTail  *resource
-	kidsHead *Scope
-	sibPrev  *Scope // guarded by parent.mu, or by slot.mu when slot != nil
-	sibNext  *Scope // guarded by parent.mu, or by slot.mu when slot != nil
-	closersC chan struct{}
-	policy   Policy
-	errs     []error // guarded by mu
+	// shards is nil until task or child registrations contend on mu; from
+	// then on they register on a shard. See shard.
+	shards    atomic.Pointer[[]*shard]
+	slot      *shard // the parent's shard this scope is registered on, or nil
+	name      string
+	stop      func() bool // unregisters the parent context's AfterFunc; guarded by mu
+	cause     error       // guarded by mu, like the fields below
+	result    error
+	first     error // first error of the result
+	resHead   *resource
+	resTail   *resource
+	kidsHead  *Scope
+	sibPrev   *Scope // guarded by parent.mu, or by slot.mu when slot != nil
+	sibNext   *Scope // guarded by parent.mu, or by slot.mu when slot != nil
+	closersC  chan struct{}
+	drainingC chan struct{} // allocated on demand; guarded by mu
+	policy    Policy
+	errs      []error // guarded by mu
 
-	mu      sync.Mutex
-	tasks   int
-	nres    int
-	nkids   int
-	pending int         // tasks and children on shards when the scope closed, not yet ended
-	idleA   atomic.Bool // idle, readable without mu by sharded task ends
-	misses  uint32      // collision window of mu, see lockCounted
-	closed  bool
-	closing bool // the closer goroutine is running
-	idle    bool // close once no task and no child is left
-	done    bool
+	mu               sync.Mutex
+	tasks            int
+	nres             int
+	nkids            int
+	pending          int           // tasks and children on shards when the scope closed, not yet ended
+	state            atomic.Uint32 // written under mu, also read under shard locks
+	misses           uint32        // collision window of mu, see lockCounted
+	closingResources bool          // the closer goroutine is running or about to start
 }
+
+// Admission closes at scopeSealing, and resource registration closes at
+// scopeClosing. An idle scope can go directly to scopeClosed: it has no
+// children to notify. scopeFinishing claims final publication exactly once.
+const (
+	scopeOpen          = iota
+	scopeCloseWhenIdle // still accepting tasks and children
+	scopeSealing       // sealed locally, propagating Drain to children
+	scopeDraining      // subtree sealed, waiting until idle
+	scopeClosing       // sealed locally, propagating Close to children
+	scopeClosed        // Close propagated, cancellation and cleanup can complete
+	scopeFinishing     // result fixed; Finished is published after cancellation
+)
 
 // A shard holds part of a busy scope's tasks and children under its own
 // mutex. A scope starts with none, so a small scope pays one nil pointer;
@@ -130,18 +142,18 @@ type Scope struct {
 // colliding. Shards are never moved or removed, so a count stays on the
 // shard it was made on. Lock order: Scope.mu before shard.mu.
 //
-// While the scope is open the shard's counts are its own. Close marks every
-// shard closed under both mutexes and moves the counts into Scope.pending;
-// a task or child that ends on a closed shard then decrements pending
-// under Scope.mu.
+// Until Close, the shard's counts are its own. Close transfers them into
+// Scope.pending under both mutexes. Tasks and children that end after the
+// transfer also decrement pending under Scope.mu.
 type shard struct {
-	kidsHead *Scope
-	tasks    int
-	nkids    int
-	mu       sync.Mutex
-	misses   uint32
-	closed   bool
-	_        [64]byte // keep busy shards on separate cache lines
+	kidsHead    *Scope
+	tasks       int
+	nkids       int
+	mu          sync.Mutex
+	busy        atomic.Bool // hint for idle checks; derived from tasks and nkids under mu
+	misses      uint32
+	transferred bool
+	_           [64]byte // keep busy shards on separate cache lines
 }
 
 // A scope, or one of its shards, asks for more shards once growAfter of
@@ -179,9 +191,10 @@ func lockCounted(mu *sync.Mutex, window *uint32) bool {
 }
 
 // grow doubles the shards of s, unless another call already grew past
-// have shards or s is closed. It runs with s.mu held.
+// have shards or s has stopped accepting tasks and children. It runs with
+// s.mu held.
 func (s *Scope) growLocked(have int) {
-	if s.closed {
+	if s.state.Load() >= scopeSealing {
 		return
 	}
 	cur := s.shards.Load()
@@ -236,40 +249,76 @@ func (s *Scope) lockBase() bool {
 	return s.shards.Load() != nil
 }
 
+var testBeforeShardIdleCheck atomic.Pointer[func(*Scope, *shard)] //nolint:gochecknoglobals // optional test barrier; avoids adding state to every scope or shard
+
 // shardEnded finishes the end of a task or child on sd: sd.mu is held and
 // the count already decremented; it unlocks.
 func (s *Scope) shardEnded(sd *shard) {
-	closed := sd.closed
+	transferred := sd.transferred
+	empty := sd.tasks == 0 && sd.nkids == 0
+	if empty {
+		// Publish before probing other shards. Once admissions are sealed,
+		// the last publication is followed by a probe that can see all empty.
+		sd.busy.Store(false)
+	}
 	sd.mu.Unlock()
 	switch {
-	case closed:
+	case transferred:
 		s.mu.Lock()
 		s.pending--
 		s.settle()
-	case s.idleA.Load():
-		s.mu.Lock()
-		s.settle()
+	case empty && settlesWhenIdle(s.state.Load()):
+		if hook := testBeforeShardIdleCheck.Load(); hook != nil {
+			(*hook)(s, sd)
+		}
+		if s.shardsMayBeIdle() {
+			s.mu.Lock()
+			s.settle()
+		}
 	}
 }
 
-// shardsEmptyLocked reports, with s.mu held, whether no task or child is
-// registered on any shard. It holds every shard's mutex at once, so the
-// answer is a consistent snapshot: a task that starts another before it
-// ends is never missed.
-func (s *Scope) shardsEmptyLocked() bool {
+// markBusy runs under sd.mu before incrementing the first task or child.
+func (sd *shard) markBusy() {
+	if sd.tasks == 0 && sd.nkids == 0 {
+		sd.busy.Store(true)
+	}
+}
+
+// shardsMayBeIdle avoids taking shard locks while work is visible. A true
+// result must be rechecked under the locks before committing to close.
+func (s *Scope) shardsMayBeIdle() bool {
+	if sh := s.shards.Load(); sh != nil {
+		for _, sd := range *sh {
+			if sd.busy.Load() {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// sealIdleShardsLocked stops admissions if all shards are empty, with s.mu
+// held and the base counts already zero. It holds all shard locks until
+// it seals the scope, so no new admission can slip in after the idle check.
+func (s *Scope) sealIdleShardsLocked() bool {
 	sh := s.shards.Load()
 	if sh == nil {
+		s.sealLocked(scopeClosed)
 		return true
 	}
-	n := 0
+	empty := true
 	for _, sd := range *sh {
 		sd.mu.Lock()
-		n += sd.tasks + sd.nkids
+		empty = empty && sd.tasks == 0 && sd.nkids == 0
+	}
+	if empty {
+		s.sealLocked(scopeClosed)
 	}
 	for _, sd := range *sh {
 		sd.mu.Unlock()
 	}
-	return n == 0
+	return empty
 }
 
 type resource struct {
@@ -314,7 +363,7 @@ func New(ctx context.Context, policy Policy) *Scope {
 		stop := context.AfterFunc(ctx, func() { s.Close(context.Cause(ctx)) })
 		s.mu.Lock()
 		s.stop = stop
-		closed := s.closed
+		closed := s.state.Load() >= scopeClosing
 		s.mu.Unlock()
 		if closed {
 			stop()
@@ -336,7 +385,7 @@ func newScope(base context.Context, name string, parent *Scope, policy Policy) *
 // context derives from s's, closing s closes the child, and s finishes only
 // after the child. The child's errors stay in the child unless its policy
 // has [Policy.Propagate]. Child panics if policy is the zero Policy and
-// returns ErrClosed if s is closed.
+// returns ErrClosed if s is draining or closed.
 func (s *Scope) Child(name string, policy Policy) (*Scope, error) {
 	// The child's context does not register with s's: Close closes the
 	// children before cancelling s, so registration would only serialise
@@ -349,7 +398,7 @@ func (s *Scope) Child(name string, policy Policy) (*Scope, error) {
 		s.mu.Unlock()
 		return s.childAdd(s.grownShard(), k)
 	}
-	if s.closed {
+	if s.state.Load() >= scopeSealing {
 		s.mu.Unlock()
 		k.cancel(ErrClosed)
 		return nil, ErrClosed
@@ -373,7 +422,7 @@ func (s *Scope) childAdd(sd *shard, k *Scope) (*Scope, error) {
 
 func (s *Scope) childOn(sd *shard, k *Scope) error {
 	s.lockShard(sd)
-	if sd.closed {
+	if s.state.Load() >= scopeSealing {
 		sd.mu.Unlock()
 		k.cancel(ErrClosed)
 		return ErrClosed
@@ -384,6 +433,7 @@ func (s *Scope) childOn(sd *shard, k *Scope) error {
 		sd.kidsHead.sibPrev = k
 	}
 	sd.kidsHead = k
+	sd.markBusy()
 	sd.nkids++
 	sd.mu.Unlock()
 	return nil
@@ -396,8 +446,24 @@ func (s *Scope) Name() string { return s.name }
 // the close cause.
 func (s *Scope) Context() context.Context { return s.ctx }
 
-// Done returns a channel closed when the scope starts closing.
+// Done returns a channel closed when the scope's context is cancelled.
 func (s *Scope) Done() <-chan struct{} { return s.ctx.Done() }
+
+// Draining returns a channel closed when this scope stops accepting tasks
+// and child scopes, by Drain or Close. A parent's shutdown reaches each
+// descendant's signal when it seals that descendant's admissions.
+func (s *Scope) Draining() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.drainingC != nil {
+		return s.drainingC
+	}
+	if s.state.Load() >= scopeSealing {
+		return closedChan
+	}
+	s.drainingC = make(chan struct{})
+	return s.drainingC
+}
 
 // Cause returns the cause the scope was closed with, or nil while it is
 // open.
@@ -412,9 +478,12 @@ func (s *Scope) Cause() error {
 // Closers, and nothing else: a cause given to Close is not an error of the
 // scope.
 func (s *Scope) Err() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.result
+	select {
+	case <-s.finished:
+		return s.result
+	default:
+		return nil
+	}
 }
 
 // Wait waits until the scope has finished and returns its result. If ctx
@@ -441,49 +510,107 @@ func (s *Scope) Finished() <-chan struct{} { return s.finished }
 
 // Go starts fn in a new goroutine with the scope's context. name identifies
 // the task in errors. fn's error and any panic are handled by the scope's
-// policy. Go returns ErrClosed, without running fn, if the scope is closed.
+// policy. Go returns ErrClosed, without running fn, if the scope is draining
+// or closed.
 func (s *Scope) Go(name string, fn func(ctx context.Context) error) error {
-	sd := s.pickShard()
+	sd, ok := s.registerTask(s.pickShard())
+	if !ok {
+		return ErrClosed
+	}
+	go s.run(sd, name, fn)
+	return nil
+}
+
+// Task is the completion handle for work registered with [Scope.Enter].
+// The zero value is safe to end. A Task returned by Enter must not be copied.
+// The go vet copylocks check flags copies. Hand off completion by passing
+// a pointer to the Task, which can cause it to escape to the heap.
+type Task struct {
+	_     [0]sync.Mutex // make go vet flag copies of a Task
+	scope *Scope
+	shard *shard
+	ended bool // guarded by the mutex that protects the task's count
+}
+
+// Enter registers work in the caller's goroutine as a task. It starts no
+// goroutine and returns ErrClosed if the scope is draining or closed. Call
+// [Task.End] when the work is done, typically with defer, or hand off the
+// handle by pointer to whoever will finish the work. The caller handles its
+// own errors and panics, outside the scope's policy. If a panic leaves a task
+// without a deferred End or an owner to end it, the scope cannot finish.
+// Task registration and completion themselves allocate no per-task storage.
+// Shard growth and scope shutdown can allocate.
+func (s *Scope) Enter() (Task, error) {
+	sd, ok := s.registerTask(s.pickShard())
+	if !ok {
+		return Task{}, ErrClosed
+	}
+	return Task{scope: s, shard: sd}, nil
+}
+
+// registerTask tries to count one task on the chosen shard or the base.
+// It returns the count's shard (nil for the base) and whether it was accepted.
+func (s *Scope) registerTask(sd *shard) (*shard, bool) {
 	if sd == nil {
 		if !s.lockBase() {
-			if s.closed {
+			if s.state.Load() >= scopeSealing {
 				s.mu.Unlock()
-				return ErrClosed
+				return nil, false
 			}
 			s.tasks++
 			s.mu.Unlock()
-			go s.run(nil, name, fn)
-			return nil
+			return nil, true
 		}
 		s.mu.Unlock()
 		sd = s.grownShard()
 	}
 	s.lockShard(sd)
-	if sd.closed {
+	if s.state.Load() >= scopeSealing {
 		sd.mu.Unlock()
-		return ErrClosed
+		return nil, false
 	}
+	sd.markBusy()
 	sd.tasks++
 	sd.mu.Unlock()
-	go s.run(sd, name, fn)
-	return nil
+	return sd, true
+}
+
+// End marks the task complete. It is safe to call on the same handle more
+// than once and from any goroutine, including concurrently. The final task
+// may complete scope shutdown, including context cancellation and starting
+// resource cleanup.
+func (t *Task) End() {
+	s, sd := t.scope, t.shard
+	if s == nil {
+		return
+	}
+	mu := &s.mu
+	if sd != nil {
+		mu = &sd.mu
+	}
+	mu.Lock()
+	if t.ended {
+		mu.Unlock()
+		return
+	}
+	t.ended = true
+	if sd != nil {
+		sd.tasks--
+		s.shardEnded(sd)
+		return
+	}
+	s.tasks--
+	s.settle()
 }
 
 func (s *Scope) run(sd *shard, name string, fn func(context.Context) error) {
+	task := Task{scope: s, shard: sd}
 	returned := false
 	defer func() {
 		if !returned { // runtime.Goexit
 			s.report(&TaskError{Name: name, Err: ErrGoexit}, false)
 		}
-		if sd != nil {
-			sd.mu.Lock()
-			sd.tasks--
-			s.shardEnded(sd)
-			return
-		}
-		s.mu.Lock()
-		s.tasks--
-		s.settle()
+		task.End()
 	}()
 	panicked, err := call(s.ctx, fn)
 	returned = true
@@ -501,15 +628,9 @@ func call(ctx context.Context, fn func(context.Context) error) (panicked bool, e
 	return false, fn(ctx)
 }
 
-// report applies the policy to a task or child error. A filterable error
-// that looks like a normal exit after the scope started closing is dropped.
+// report applies the policy to a task or child error.
 func (s *Scope) report(te *TaskError, filterable bool) {
-	// errors.Is may call user Is methods and Expected is user code: both
-	// run with no lock held.
-	s.mu.Lock()
-	closed, cause := s.closed, s.cause
-	s.mu.Unlock()
-	if filterable && closed && (errors.Is(te.Err, cause) || s.isExpected(te.Err)) {
+	if filterable && s.expectedExit(te.Err) {
 		return
 	}
 	if s.policy.isolate {
@@ -520,6 +641,20 @@ func (s *Scope) report(te *TaskError, filterable bool) {
 	s.errs = append(s.errs, te)
 	s.mu.Unlock()
 	s.Close(te) // no-op if already closed
+}
+
+// expectedExit uses the admission state and the actual cancellation signal.
+// Matching errors and calling Expected may run user code, with no lock held.
+func (s *Scope) expectedExit(err error) bool {
+	if s.state.Load() < scopeSealing {
+		return false
+	}
+	select {
+	case <-s.Done():
+		return errors.Is(err, context.Cause(s.ctx)) || s.isExpected(err)
+	default:
+		return errors.Is(err, ErrClosed)
+	}
 }
 
 func (s *Scope) isExpected(err error) bool {
@@ -541,7 +676,7 @@ func (s *Scope) Add(c io.Closer) (remove func() bool, err error) {
 	}
 	r := &resource{c: c}
 	s.mu.Lock()
-	if s.closed {
+	if s.state.Load() >= scopeClosing {
 		s.mu.Unlock()
 		return func() bool { return false }, errors.Join(ErrClosed, closeOne(c))
 	}
@@ -560,7 +695,7 @@ func (s *Scope) Add(c io.Closer) (remove func() bool, err error) {
 func (s *Scope) remove(r *resource) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || r.removed {
+	if s.state.Load() >= scopeClosing || r.removed {
 		return false
 	}
 	r.removed = true
@@ -590,24 +725,101 @@ func closeOne(c io.Closer) (err error) {
 
 // Close starts closing the scope and its descendants with cause, or with
 // ErrClosed if cause is nil, and reports whether this call started it. It
-// does not block and runs no user code: when it returns, the whole subtree
-// is closed and its contexts are cancelled, and the resources are being
-// closed by at most one goroutine per scope. Use Wait to wait for the end.
+// does not wait for tasks and runs no user code. When it returns, the
+// subtree is sealed and it has cancelled the contexts of the scopes it
+// started closing. With concurrent Close calls, a scope already being
+// closed by another call can still have a live context. Wait on that
+// scope's [Scope.Done] channel to observe its cancellation. Use [Scope.Wait]
+// to wait for all tasks, children and resource cleanup.
 func (s *Scope) Close(cause error) bool {
 	s.mu.Lock()
-	return s.closeLocked(cause)
+	switch s.state.Load() {
+	case scopeClosed, scopeFinishing:
+		s.mu.Unlock()
+		return false
+	case scopeClosing:
+		s.continueCloseLocked()
+		return false
+	case scopeOpen, scopeCloseWhenIdle, scopeSealing, scopeDraining:
+		// Close below.
+	}
+	s.sealLocked(scopeClosing)
+	s.closeLocked(cause)
+	return true
 }
 
-// closeLocked is Close with s.mu held; it unlocks.
-func (s *Scope) closeLocked(cause error) bool {
+// sealLocked advances the state with s.mu held and publishes the cutoff at
+// its first transition. Shard admissions also observe it through state.
+func (s *Scope) sealLocked(state uint32) {
+	first := s.state.Load() < scopeSealing
+	s.state.Store(state)
+	if first && s.drainingC != nil {
+		close(s.drainingC)
+	}
+}
+
+// closeLocked completes the transition to Close with admissions already
+// sealed and s.mu held. It unlocks before propagating shutdown.
+func (s *Scope) closeLocked(cause error) {
 	if cause == nil {
 		cause = ErrClosed
 	}
-	if s.closed {
-		s.mu.Unlock()
-		return false
+	s.cause = cause
+	var kids []*Scope
+	if s.state.Load() == scopeClosing {
+		kids = s.childrenLocked(true)
+		if len(kids) == 0 {
+			s.state.Store(scopeClosed)
+		}
 	}
-	s.closed, s.cause = true, cause
+	last := s.resTail
+	s.resHead, s.resTail, s.nres = nil, nil, 0
+	needCloser := kids != nil || last != nil
+	s.closingResources = needCloser
+	stop := s.stop
+	fin := s.finishableLocked()
+	s.mu.Unlock()
+
+	if stop != nil {
+		stop()
+	}
+	if len(kids) > 0 {
+		s.closeChildren(kids, cause)
+	}
+	s.cancel(cause)
+	if needCloser {
+		go s.closeResources(kids, last)
+	}
+	if fin {
+		s.finish()
+	}
+}
+
+// continueCloseLocked assists a concurrent Close with its chosen cause.
+// It unlocks before visiting children.
+func (s *Scope) continueCloseLocked() {
+	kids, cause := s.childrenLocked(false), s.cause
+	s.mu.Unlock()
+	s.closeChildren(kids, cause)
+}
+
+// closeChildren propagates the chosen cause before publishing that the
+// subtree is sealed. Concurrent callers may help with this traversal.
+func (s *Scope) closeChildren(kids []*Scope, cause error) {
+	for _, k := range kids {
+		k.Close(cause)
+	}
+	s.mu.Lock()
+	if s.state.Load() == scopeClosing {
+		s.state.Store(scopeClosed)
+	}
+	s.mu.Unlock()
+}
+
+// childrenLocked snapshots the children after the admission cutoff. A
+// registration that passed the cutoff check holds its count lock until
+// it is visible here. Close also transfers ownership of the shard counts.
+func (s *Scope) childrenLocked(takeCounts bool) []*Scope {
 	var kids []*Scope
 	if s.nkids > 0 {
 		kids = make([]*Scope, 0, s.nkids)
@@ -618,36 +830,17 @@ func (s *Scope) closeLocked(cause error) bool {
 	if sh := s.shards.Load(); sh != nil {
 		for _, sd := range *sh {
 			sd.mu.Lock()
-			sd.closed = true
-			s.pending += sd.tasks + sd.nkids
+			if takeCounts {
+				sd.transferred = true
+				s.pending += sd.tasks + sd.nkids
+			}
 			for k := sd.kidsHead; k != nil; k = k.sibNext {
 				kids = append(kids, k)
 			}
 			sd.mu.Unlock()
 		}
 	}
-	last := s.resTail
-	s.resHead, s.resTail, s.nres = nil, nil, 0
-	needCloser := kids != nil || last != nil
-	s.closing = needCloser
-	stop := s.stop
-	fin := s.finishableLocked()
-	s.mu.Unlock()
-
-	if stop != nil {
-		stop()
-	}
-	for _, k := range kids {
-		k.Close(cause)
-	}
-	s.cancel(cause)
-	if needCloser {
-		go s.closeResources(kids, last)
-	}
-	if fin {
-		s.finish()
-	}
-	return true
+	return kids
 }
 
 // closeResources waits until the children have closed their resources,
@@ -664,7 +857,7 @@ func (s *Scope) closeResources(kids []*Scope, last *resource) {
 	}
 	s.mu.Lock()
 	s.errs = append(s.errs, errs...)
-	s.closing = false
+	s.closingResources = false
 	ch := s.closersC
 	fin := s.finishableLocked()
 	s.mu.Unlock()
@@ -687,7 +880,7 @@ var closedChan = func() chan struct{} { //nolint:gochecknoglobals // read-only c
 func (s *Scope) closersDone() <-chan struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.closing {
+	if !s.closingResources {
 		return closedChan
 	}
 	if s.closersC == nil {
@@ -698,23 +891,70 @@ func (s *Scope) closersDone() <-chan struct{} {
 
 // CloseWhenIdle closes the scope, with ErrClosed as cause, as soon as no
 // task is running and no child scope is left, which may be at once. Until
-// then Go and Child keep working; a task may start more tasks.
+// then Go, Child and Enter keep working. Child scopes keep their own
+// lifetimes so a batch can wait for children that are still accepting work.
+// Use [Scope.Drain] to stop admissions throughout the subtree.
 func (s *Scope) CloseWhenIdle() {
 	s.mu.Lock()
-	if s.closed {
+	if s.state.Load() != scopeOpen {
 		s.mu.Unlock()
 		return
 	}
-	s.idle = true
-	s.idleA.Store(true)
+	s.state.Store(scopeCloseWhenIdle)
 	s.settle()
 }
 
+// Drain stops admissions on s and walks the subtree, sealing each scope
+// in turn. A descendant may still accept work until Drain reaches it.
+// The whole subtree has stopped admitting tasks and children when Drain
+// returns. Each scope closes with ErrClosed as cause once its admitted
+// tasks and children finish.
+// Drain returns without waiting for work to finish. In-flight work keeps
+// its context live and can still register resources with Add while draining.
+// Call Close at any time to cancel outstanding work and close descendants.
+func (s *Scope) Drain() {
+	s.mu.Lock()
+	state := s.state.Load()
+	switch state {
+	case scopeDraining, scopeClosed, scopeFinishing:
+		s.mu.Unlock()
+		return
+	case scopeClosing:
+		s.continueCloseLocked()
+		return
+	case scopeOpen, scopeCloseWhenIdle, scopeSealing:
+		// Drain below.
+	}
+	if state < scopeSealing {
+		s.sealLocked(scopeSealing)
+	}
+	// Another Drain may be walking these children. Visit them as well so
+	// every caller returns after the cutoff.
+	kids := s.childrenLocked(false)
+	if len(kids) > 0 {
+		s.mu.Unlock()
+		for _, k := range kids {
+			k.Drain()
+		}
+		s.mu.Lock()
+	}
+	if s.state.Load() == scopeSealing {
+		s.state.Store(scopeDraining)
+		s.settle()
+		return
+	}
+	s.mu.Unlock()
+}
+
+func settlesWhenIdle(state uint32) bool {
+	return state == scopeCloseWhenIdle || state == scopeDraining
+}
+
 // settle runs with s.mu held after a task or child left, or after
-// CloseWhenIdle, and unlocks: it closes an idle scope or finishes a
-// drained one.
+// CloseWhenIdle or Drain, and unlocks. It starts a graceful close once
+// idle, or finishes shutdown after a close.
 func (s *Scope) settle() {
-	if s.idle && !s.closed && s.tasks == 0 && s.nkids == 0 && s.shardsEmptyLocked() {
+	if settlesWhenIdle(s.state.Load()) && s.tasks == 0 && s.nkids == 0 && s.shardsMayBeIdle() && s.sealIdleShardsLocked() {
 		s.closeLocked(nil)
 		return
 	}
@@ -725,13 +965,13 @@ func (s *Scope) settle() {
 	}
 }
 
-// finishableLocked reports, once, that the scope has just finished, and
-// records its result.
+// finishableLocked claims completion once and records the result. The
+// owner publishes it after cancellation in finish.
 func (s *Scope) finishableLocked() bool {
-	if !s.closed || s.done || s.closing || s.tasks > 0 || s.nkids > 0 || s.pending > 0 {
+	if s.state.Load() != scopeClosed || s.closingResources || s.tasks > 0 || s.nkids > 0 || s.pending > 0 {
 		return false
 	}
-	s.done = true
+	s.state.Store(scopeFinishing)
 	s.result = errors.Join(s.errs...)
 	if len(s.errs) > 0 {
 		s.first = s.errs[0]
@@ -741,6 +981,8 @@ func (s *Scope) finishableLocked() bool {
 }
 
 func (s *Scope) finish() {
+	// The last task may finish while Close is still cancelling the context.
+	<-s.Done()
 	close(s.finished)
 	if p := s.parent; p != nil {
 		p.childFinished(s)
@@ -784,10 +1026,22 @@ func (s *Scope) childFinished(k *Scope) {
 // whole subtree, locking one scope at a time, so its cost grows with the
 // number of descendants: use it for diagnostics, not on a hot path. The
 // totals are not kept incrementally because that would make every Go,
-// Child and Add update every ancestor, contending on the root.
+// Enter, Child and Add update every ancestor, contending on the root.
 func (s *Scope) Stats() Stats {
 	s.mu.Lock()
-	st := Stats{Tasks: s.tasks, Resources: s.nres, Scopes: s.nkids, Closed: s.closed, Finished: s.done}
+	state := s.state.Load()
+	st := Stats{
+		Tasks:     s.tasks,
+		Resources: s.nres,
+		Scopes:    s.nkids,
+		Draining:  state >= scopeSealing && state < scopeClosing,
+		Closed:    state >= scopeClosing,
+	}
+	select {
+	case <-s.finished:
+		st.Finished = true
+	default:
+	}
 	var kids []*Scope
 	for k := s.kidsHead; k != nil; k = k.sibNext {
 		kids = append(kids, k)
