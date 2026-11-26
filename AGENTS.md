@@ -15,7 +15,7 @@
   document any new one and how it ends.
 - Queue `Push`, `Pop` and `TryPop`, and the `Set`, `Wait`, `Pop` and
   `TryPop`/`TryGet` of `Latest` and `KeyedLatest`, stay allocation-free; there is no
-  unbounded mode.
+  unbounded mode. A blocked write with a positive BlockTimeout allocates its timer.
 - Tests must not leak goroutines or timers, and stress tests are bounded
   in time.
 - The README, docs and commits name no other project and quote no benchmark

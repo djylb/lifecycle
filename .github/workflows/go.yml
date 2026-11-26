@@ -32,7 +32,12 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache: false
-      - run: go test -race -count=1 ./...
+      - run: go test -timeout=2m -race -count=1 ./...
+
+      - if: matrix.os == 'ubuntu-latest' && matrix.go == 'stable'
+        run: |
+          go test -timeout=1m -parallel=2 -run='^$' -fuzz='^FuzzCloseRaces$' -fuzztime=2s .
+          go test -timeout=1m -parallel=2 -run='^$' -fuzz='^FuzzKeyedLatest$' -fuzztime=2s .
 
   cross-vet:
     runs-on: ubuntu-latest
@@ -63,7 +68,7 @@ jobs:
               # ios binaries need cgo to link, so only vet it (vet needs no C compiler).
               CGO_ENABLED=1 go vet ./... || failed+=("$target")
             else
-              { go vet ./... && go test -c -o /dev/null ./...; } || failed+=("$target")
+              { go vet ./... && go test -timeout=2m -c -o /dev/null ./...; } || failed+=("$target")
             fi
             echo "::endgroup::"
           done
@@ -82,7 +87,7 @@ jobs:
           cache: false
       - name: go test on js/wasm under node
         # cross-vet only builds the tests; this runs them on the fake js network stack.
-        run: PATH="$PATH:$(go env GOROOT)/lib/wasm" GOOS=js GOARCH=wasm go test -count=1 ./...
+        run: PATH="$PATH:$(go env GOROOT)/lib/wasm" GOOS=js GOARCH=wasm go test -timeout=2m -count=1 ./...
 
   gofmt:
     runs-on: ubuntu-latest

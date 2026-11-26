@@ -215,21 +215,19 @@ func TestKeyedLatestBlock(t *testing.T) {
 	if err := q.Set(ctx, 2, 2); !errors.Is(err, lifecycle.ErrFull) {
 		t.Fatalf("timeout: %v", err)
 	}
+	q2 := newKeyed(t, lifecycle.KeyedLatestConfig[int, int]{Capacity: 1, Full: lifecycle.Block})
+	defer mustCloseC(t, q2)
+	mustSetKeyed(t, q2, 0, 0)
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := q.Set(cctx, 2, 2); !errors.Is(err, context.Canceled) {
+	if err := q2.Set(cctx, 2, 2); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ctx: %v", err)
 	}
-
-	q2 := newKeyed(t, lifecycle.KeyedLatestConfig[int, int]{Capacity: 1, Full: lifecycle.Block})
-	mustSetKeyed(t, q2, 0, 0)
 	errc := make(chan error, 3)
 	for k := 1; k <= 3; k++ {
 		go func() { errc <- q2.Set(ctx, k, k) }()
 	}
-	for q2.Stats().Waited < 3 {
-		time.Sleep(time.Millisecond)
-	}
+	awaitCondition(t, func() bool { return q2.Stats().Waited == 4 })
 	// One Pop frees one slot at a time; every blocked Set must get in.
 	for range 3 {
 		if _, _, err := q2.Pop(ctx); err != nil {
@@ -252,11 +250,10 @@ func TestKeyedLatestBlock(t *testing.T) {
 
 	// Close wakes a blocked Set.
 	q3 := newKeyed(t, lifecycle.KeyedLatestConfig[int, int]{Capacity: 1, Full: lifecycle.Block})
+	defer mustCloseC(t, q3)
 	mustSetKeyed(t, q3, 0, 0)
 	go func() { errc <- q3.Set(ctx, 1, 1) }()
-	for q3.Stats().Waited < 1 {
-		time.Sleep(time.Millisecond)
-	}
+	awaitCondition(t, func() bool { return q3.Stats().Waited >= 1 })
 	mustCloseC(t, q3)
 	if err := <-errc; !errors.Is(err, lifecycle.ErrQueueClosed) {
 		t.Fatalf("blocked set after close: %v", err)
@@ -366,6 +363,12 @@ func keyedModel(t *testing.T, ops []byte) {
 	if !slices.Equal(dropped, wantDropped) || q.Len() != len(model) {
 		t.Fatalf("dropped %v want %v; len %d model %v", dropped, wantDropped, q.Len(), model)
 	}
+	for _, want := range model {
+		k, v, ok := q.TryPop()
+		if !ok || (kv{k, v}) != want {
+			t.Fatalf("remaining entry (%v,%v,%v), want %v", k, v, ok, want)
+		}
+	}
 }
 
 // TestLatestStress checks with concurrent setters that every value is
@@ -464,5 +467,16 @@ func TestKeyedLatestStress(t *testing.T) {
 				t.Fatalf("accepted %d, popped %d dropped %d taken %d", accepted.Load(), poppedN.Load(), droppedN.Load(), taken)
 			}
 		})
+	}
+}
+
+func awaitCondition(t *testing.T, ready func() bool) {
+	t.Helper()
+	end := time.Now().Add(3 * time.Second)
+	for !ready() {
+		if time.Now().After(end) {
+			t.Fatal("condition timed out")
+		}
+		runtime.Gosched()
 	}
 }

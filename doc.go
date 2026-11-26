@@ -72,9 +72,18 @@
 //     panics and its error has been delivered.
 //   - At most one per scope when it closes and holds resources or child
 //     scopes; it ends when the resources are closed.
-//   - For a root scope whose parent context is cancelled before the scope is
-//     closed, the one goroutine of context.AfterFunc, which calls Close and
-//     ends. Closing the scope first unregisters it.
+//   - A root with a live, cancellable parent starts a watcher. It exits
+//     when either context ends, propagating parent cancellation to the scope.
+//   - A child with a non-nil result and Policy.Propagate starts one goroutine
+//     to deliver the error. It unlinks the child when the parent's policy returns
+//     or exits. The parent's Wait includes this work.
+//   - A context derived directly from Scope.Context can use context.AfterFunc
+//     to run cancellation in a short-lived callback goroutine. Wrapping the
+//     scope context with context.WithValue hides AfterFunc. Deriving a
+//     cancellable context from that wrapper can start a standard-library
+//     propagation goroutine that waits until either context is cancelled.
+//   - If a Closer exits its goroutine with runtime.Goexit, a replacement
+//     cleanup goroutine closes the remaining resources and publishes completion.
 //
 // [Queue], [Latest] and [KeyedLatest] start no goroutines. They must be
 // created with their constructors. On a zero value, the methods that return

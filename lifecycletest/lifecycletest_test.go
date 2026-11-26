@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/djylb/lifecycle"
@@ -36,20 +37,26 @@ func (r *recorder) Errorf(format string, args ...any) {
 func (r *recorder) Error(args ...any) { r.failed = append(r.failed, fmt.Sprint(args...)) }
 
 func TestLeaks(t *testing.T) {
-	base := lifecycletest.Goroutines()
-	stop := make(chan struct{})
-	go func() { <-stop }()
-	leaked := lifecycletest.Leaks(base, 10*time.Millisecond)
-	if len(leaked) != 1 || leaked[0].State != "chan receive" || !strings.Contains(leaked[0].Stack, "TestLeaks") {
-		t.Fatalf("leaks %v", leaked)
-	}
-	if got := lifecycletest.Leaks(base, 0, "TestLeaks"); len(got) != 0 {
-		t.Fatalf("ignored goroutine reported: %v", got)
-	}
-	close(stop)
-	if got := lifecycletest.Leaks(base, time.Second); len(got) != 0 {
-		t.Fatalf("ended goroutine reported: %v", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		base := lifecycletest.Goroutines()
+		func() {
+			stop := make(chan struct{})
+			defer close(stop)
+			go func() { <-stop }()
+			synctest.Wait()
+			leaked := lifecycletest.Leaks(base, 0)
+			if len(leaked) != 1 || !strings.HasPrefix(leaked[0].State, "chan receive") || !strings.Contains(leaked[0].Stack, "TestLeaks") {
+				t.Fatalf("leaks %v", leaked)
+			}
+			if got := lifecycletest.Leaks(base, 0, "TestLeaks"); len(got) != 0 {
+				t.Fatalf("ignored goroutine reported: %v", got)
+			}
+		}()
+		synctest.Wait()
+		if got := lifecycletest.Leaks(base, 0); len(got) != 0 {
+			t.Fatalf("ended goroutine reported: %v", got)
+		}
+	})
 }
 
 func TestCheckGoroutines(t *testing.T) {
@@ -97,5 +104,50 @@ func TestRunCycle(t *testing.T) {
 	})
 	if err != nil || len(r.failed) != 1 || !strings.Contains(r.failed[0], "leaked") {
 		t.Fatalf("leak not reported: %v", r.failed)
+	}
+}
+
+func TestRunCycleStartupPanic(t *testing.T) {
+	ended := make(chan struct{})
+	func() {
+		defer func() {
+			if recover() != "startup" {
+				t.Fatal("startup panic lost")
+			}
+		}()
+		_ = lifecycletest.RunCycle(t, time.Second, func(s *lifecycle.Scope) error {
+			mustGo(t, s, "worker", func(ctx context.Context) error { defer close(ended); <-ctx.Done(); return nil })
+			panic("startup")
+		})
+	}()
+	select {
+	case <-ended:
+	default:
+		t.Fatal("worker outlived failed startup")
+	}
+}
+
+func TestStartupPanicDuringTimeout(t *testing.T) {
+	r := &recorder{TB: t}
+	stop := make(chan struct{})
+	var scope *lifecycle.Scope
+	func() {
+		defer func() {
+			if got := recover(); got != "startup" {
+				t.Errorf("panic: %v", got)
+			}
+		}()
+		_ = lifecycletest.RunCycle(r, 0, func(s *lifecycle.Scope) error {
+			scope = s
+			mustGo(t, s, "blocked", func(context.Context) error { <-stop; return nil })
+			panic("startup")
+		})
+	}()
+	close(stop)
+	if err := scope.Wait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.failed) != 1 || !strings.Contains(r.failed[0], "did not finish") {
+		t.Fatal(r.failed)
 	}
 }

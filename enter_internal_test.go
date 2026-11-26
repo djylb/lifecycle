@@ -207,11 +207,14 @@ func TestDrainDuringCloseCascade(t *testing.T) {
 	signal := leaf.Draining()
 	paused := make(chan struct{})
 	resume := make(chan struct{})
-	child.stop = func() bool {
-		close(paused)
-		<-resume
-		return true
+	hook := func(target *Scope) {
+		if target == child {
+			close(paused)
+			<-resume
+		}
 	}
+	testBeforeClosePropagation.Store(&hook)
+	defer testBeforeClosePropagation.Store(nil)
 	cause := errors.New("forced close")
 	var workers sync.WaitGroup
 	workers.Go(func() { root.Close(cause) })
@@ -378,11 +381,14 @@ func TestFinishedFollowsCancellation(t *testing.T) {
 		signal := s.Draining()
 		beforeCancel := make(chan struct{})
 		resumeClose := make(chan struct{})
-		s.stop = func() bool {
-			close(beforeCancel)
-			<-resumeClose
-			return true
+		hook := func(target *Scope) {
+			if target == s {
+				close(beforeCancel)
+				<-resumeClose
+			}
 		}
+		testBeforeClosePropagation.Store(&hook)
+		defer testBeforeClosePropagation.Store(nil)
 		var workers sync.WaitGroup
 		workers.Go(func() { s.Close(nil) })
 		<-beforeCancel
@@ -504,6 +510,106 @@ func TestEnterAllocs(t *testing.T) {
 		case <-s.Finished():
 		default:
 			t.Fatal("Drain did not close an idle scope")
+		}
+	})
+}
+
+func TestWriterRoundCancellationHandoff(t *testing.T) {
+	var w writerRounds
+	for i := range w.rounds {
+		w.rounds[i].signal = make(signal, 1)
+	}
+	first := w.join()
+	w.notify()
+	next := w.join()
+	w.notify()
+	w.leave(first) // cancellation wins before the last waiter consumes the token
+	select {
+	case <-first.signal:
+		t.Fatal("stale token")
+	default:
+	}
+	select {
+	case <-next.signal:
+	default:
+		t.Fatal("lost handoff")
+	}
+	w.leave(next)
+}
+
+func TestFirstReportedCause(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		first, second := errors.New("first"), errors.New("second")
+		propagating, release := make(chan struct{}), make(chan struct{})
+		hook := func(*Scope) { close(propagating); <-release }
+		testBeforeClosePropagation.Store(&hook)
+		defer testBeforeClosePropagation.Store(nil)
+		var scope *Scope
+		got := Run(t.Context(), func(s *Scope) error {
+			scope = s
+			if err := s.Go("second", func(context.Context) error { <-propagating; return second }); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Go("first", func(context.Context) error { return first }); err != nil {
+				t.Fatal(err)
+			}
+			<-propagating
+			synctest.Wait() // the second report finishes while the first Close is paused
+			close(release)
+			<-s.Finished()
+			return errors.New("late")
+		})
+		if !errors.Is(got, first) || !errors.Is(scope.Cause(), first) || !errors.Is(context.Cause(scope.Context()), first) || !errors.Is(scope.Err(), second) {
+			t.Fatal(got, scope.Cause(), scope.Err())
+		}
+	})
+}
+
+func TestChildCloseDuringErrorPropagation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		handled, release := make(chan struct{}), make(chan struct{})
+		root := New(t.Context(), Isolate(func(error) { close(handled); <-release }))
+		child, err := root.Child("worker", CancelOnError().Propagate())
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf, err := child.Child("last", CancelOnError())
+		if err != nil {
+			t.Fatal(err)
+		}
+		paused, resume := make(chan struct{}), make(chan struct{})
+		hook := func(s *Scope) {
+			if s == leaf {
+				close(paused)
+				<-resume
+			}
+		}
+		testBeforeClosePropagation.Store(&hook)
+		defer testBeforeClosePropagation.Store(nil)
+		returned := make(chan struct{})
+		go func() { leaf.Close(nil); close(returned) }()
+		<-paused
+		if err := child.Go("fail", func(context.Context) error { return errors.New("task failure") }); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait() // child has only the paused leaf left to join
+		close(resume)
+		<-handled
+		synctest.Wait()
+		select {
+		case <-returned:
+		default:
+			t.Error("leaf Close waited for the root's error handler")
+		}
+		root.Close(nil)
+		select {
+		case <-root.Finished():
+			t.Error("root finished during its error handler")
+		default:
+		}
+		close(release)
+		if err := waitScope(t, root); err != nil {
+			t.Fatal(err)
 		}
 	})
 }

@@ -26,8 +26,8 @@ func wait(t *testing.T, s *lifecycle.Scope) error {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), waitLimit)
 	defer cancel()
-	err := s.Wait(ctx)
-	if errors.Is(err, lifecycle.ErrNotFinished) {
+	finished, err := s.WaitResult(ctx)
+	if !finished {
 		t.Fatalf("scope did not finish: %+v", s.Stats())
 	}
 	return err
@@ -428,9 +428,6 @@ func TestChildErrorReachesParent(t *testing.T) {
 	}
 	if s.Cause() != nil {
 		t.Fatal("isolated parent closed")
-	}
-	if st := s.Stats(); st.Scopes != 0 {
-		t.Fatalf("finished child still linked: %+v", st)
 	}
 	s.Close(nil)
 	if err := wait(t, s); err != nil {

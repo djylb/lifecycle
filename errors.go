@@ -16,14 +16,11 @@ var (
 	// ends before the scope has finished.
 	ErrNotFinished = errors.New("lifecycle: scope not finished")
 
-	// ErrGoexit is reported for a task that called runtime.Goexit, for
-	// example through testing.T.FailNow.
-	ErrGoexit = errors.New("lifecycle: task called runtime.Goexit")
+	// ErrGoexit is reported for a task, registered Closer or policy callback that calls runtime.Goexit.
+	ErrGoexit = errors.New("lifecycle: callback called runtime.Goexit")
 
 	errNilCloser = errors.New("lifecycle: nil io.Closer")
 
-	errLatestCapacity    = errors.New("lifecycle: KeyedLatest capacity must be positive")
-	errLatestFull        = errors.New("lifecycle: KeyedLatest full policy not set")
 	errLatestOnDrop      = errors.New("lifecycle: DropOldest KeyedLatest needs OnDrop")
 	errBlockTimeout      = errors.New("lifecycle: BlockTimeout must be zero or positive and is only used by Block")
 	errQueueCapacity     = errors.New("lifecycle: queue capacity must be positive")
@@ -44,7 +41,7 @@ func (e *TaskError) Error() string {
 
 func (e *TaskError) Unwrap() error { return e.Err }
 
-// PanicError is a panic recovered from a task or a Closer.
+// PanicError is a panic recovered from a task, Closer or policy callback.
 type PanicError struct {
 	Value any    // value passed to panic
 	Stack []byte // stack of the panicking goroutine, from runtime/debug.Stack

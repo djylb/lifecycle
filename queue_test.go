@@ -97,27 +97,29 @@ func TestQueueBlock(t *testing.T) {
 	if err := q.Push(ctx, 2); !errors.Is(err, lifecycle.ErrFull) {
 		t.Fatalf("timeout push: %v", err)
 	}
+	q2 := newQueue(t, lifecycle.QueueConfig[int]{Capacity: 1, Full: lifecycle.Block})
+	mustPush(t, q2, 1)
+	defer mustClose(t, q2)
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := q.Push(cctx, 2); !errors.Is(err, context.Canceled) {
+	if err := q2.Push(cctx, 2); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled push: %v", err)
 	}
 
 	// A waiting push completes once a pop makes room.
-	q2 := newQueue(t, lifecycle.QueueConfig[int]{Capacity: 1, Full: lifecycle.Block})
-	mustPush(t, q2, 1)
-	res := make(chan error)
+	res := make(chan error, 1)
 	go func() { res <- q2.Push(ctx, 2) }()
-	for q2.Stats().Waited == 0 {
-		time.Sleep(time.Millisecond)
-	}
+	awaitCondition(t, func() bool { return q2.Stats().Waited == 2 })
 	if v, _ := q2.Pop(ctx); v != 1 {
 		t.Fatalf("pop %d", v)
 	}
 	if err := <-res; err != nil {
 		t.Fatal(err)
 	}
-	if st := q.Stats(); st.Waited != 2 || st.Rejected != 2 || st.Pushed != 1 {
+	if st := q.Stats(); st.Waited != 1 || st.Rejected != 1 || st.Pushed != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+	if st := q2.Stats(); st.Waited != 2 || st.Rejected != 1 || st.Pushed != 2 {
 		t.Fatalf("stats %+v", st)
 	}
 }
@@ -126,11 +128,10 @@ func TestQueueCloseWakesAndDrains(t *testing.T) {
 	ctx := context.Background()
 	q := newQueue(t, lifecycle.QueueConfig[int]{Capacity: 1, Full: lifecycle.Block})
 	mustPush(t, q, 7)
-	pushed := make(chan error)
+	defer mustClose(t, q)
+	pushed := make(chan error, 1)
 	go func() { pushed <- q.Push(ctx, 8) }()
-	for q.Stats().Waited == 0 {
-		time.Sleep(time.Millisecond)
-	}
+	awaitCondition(t, func() bool { return q.Stats().Waited != 0 })
 	mustClose(t, q)
 	mustClose(t, q)
 	if err := <-pushed; !errors.Is(err, lifecycle.ErrQueueClosed) {

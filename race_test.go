@@ -100,7 +100,7 @@ func race(t *testing.T, ops []byte, closeAfter int) {
 	wg.Wait()
 	ctx, cancel := context.WithTimeout(context.Background(), waitLimit)
 	defer cancel()
-	if err := root.Wait(ctx); errors.Is(err, lifecycle.ErrNotFinished) {
+	if finished, _ := root.WaitResult(ctx); !finished {
 		t.Fatalf("tree did not finish: %+v", root.Stats())
 	}
 	if accepted.Load() != ran.Load() {

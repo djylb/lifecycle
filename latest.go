@@ -3,14 +3,25 @@ package lifecycle
 import (
 	"context"
 	"errors"
+	"hash/maphash"
+	"reflect"
 	"sync"
 	"time"
 )
 
 var (
+	// ErrInvalidKey indicates a dynamically incomparable or non-reflexive key.
+	ErrInvalidKey      = errors.New("lifecycle: invalid mailbox key")
 	errZeroLatest      = errors.New("lifecycle: Latest not created by NewLatest")
 	errZeroKeyedLatest = errors.New("lifecycle: KeyedLatest not created by NewKeyedLatest")
 )
+
+func closeMailbox(closed *bool, done chan struct{}) {
+	if !*closed {
+		*closed = true
+		close(done)
+	}
+}
 
 // signal wakes one waiter. It holds at most one token, so a send never
 // blocks; a waiter that takes a token re-checks the state under the lock
@@ -39,8 +50,9 @@ type LatestStats struct {
 	Len         int    // 1 if a value is pending, else 0
 }
 
+// Latest must be constructed with NewLatest and must not be copied.
 // Latest is a single-slot mailbox where the newest value wins: Set never
-// blocks and replaces a value that has not been taken yet. It is safe for
+// waits for space and replaces a value that has not been taken yet. It is safe for
 // concurrent use, starts no goroutines, and waiting calls park on channels
 // with no lock held. It is meant for one consumer; with several, each
 // value goes to one of them.
@@ -71,7 +83,7 @@ func NewLatest[T any](cfg LatestConfig[T]) *Latest[T] {
 }
 
 // Set stores v as the pending value, replacing and passing to OnDrop any
-// value not taken yet. It never blocks. On a closed Latest it returns
+// value not taken yet. It never waits for space. On a closed Latest it returns
 // ErrQueueClosed and v stays with the caller.
 func (l *Latest[T]) Set(v T) error {
 	if l.ready == nil {
@@ -166,10 +178,7 @@ func (l *Latest[T]) Close() error {
 		return nil
 	}
 	l.mu.Lock()
-	if !l.closed {
-		l.closed = true
-		close(l.done)
-	}
+	closeMailbox(&l.closed, l.done)
 	l.mu.Unlock()
 	return nil
 }
@@ -215,11 +224,64 @@ type KeyedLatestStats struct {
 	Cap         int    // capacity
 }
 
+// Waiting setters join the collecting round. A change releases that entire
+// round by passing one token between its members. A change during delivery
+// schedules the collecting round next, so new arrivals cannot steal tokens.
+type writerRounds struct {
+	rounds     [2]writerRound
+	collecting int
+	pending    bool
+}
+type writerRound struct {
+	signal signal
+	count  int
+}
+
+func (w *writerRounds) join() *writerRound {
+	r := &w.rounds[w.collecting]
+	r.count++
+	return r
+}
+
+func (w *writerRounds) notify() {
+	if w.rounds[w.collecting].count == 0 {
+		return
+	}
+	if w.rounds[1-w.collecting].count != 0 {
+		w.pending = true
+		return
+	}
+	w.pending = false
+	w.collecting = 1 - w.collecting
+	w.rounds[1-w.collecting].signal.notify()
+}
+
+func (w *writerRounds) leave(r *writerRound) {
+	r.count--
+	if r == &w.rounds[w.collecting] {
+		return
+	}
+	if r.count != 0 {
+		r.signal.notify()
+		return
+	}
+	// A cancelled waiter may have left the delivery token in the channel.
+	select {
+	case <-r.signal:
+	default:
+	}
+	if w.pending {
+		w.pending = false
+		w.notify()
+	}
+}
+
 type keyedEntry[K comparable, T any] struct {
 	key K
 	v   T
 }
 
+// KeyedLatest must be constructed with NewKeyedLatest and must not be copied.
 // KeyedLatest keeps the newest value of each key, for at most Capacity
 // distinct pending keys. Pop returns pending keys in the order in which they
 // became pending; a Set on a pending key replaces its value without moving
@@ -231,15 +293,17 @@ type keyedEntry[K comparable, T any] struct {
 // TakePending removes them as well. Close implements io.Closer, so a KeyedLatest
 // can be added to a [Scope].
 type KeyedLatest[K comparable, T any] struct {
-	mu      sync.Mutex
-	ring    []keyedEntry[K, T] // pending keys in FIFO order, from head
-	head, n int
-	index   map[K]int // key -> position in ring
-	ready   signal    // a key is pending
-	space   signal    // a slot is free, for Block
-	done    chan struct{}
-	onDrop  func(K, T)
-	timeout time.Duration
+	mu            sync.Mutex
+	ring          []keyedEntry[K, T] // pending keys in FIFO order, from head
+	head, n       int
+	buckets, next []int // collision chains, ring positions plus one
+	seed          maphash.Seed
+	writers       writerRounds
+	ready         signal // a key is pending
+	space         signal // a slot is free, for Block
+	done          chan struct{}
+	onDrop        func(K, T)
+	timeout       time.Duration
 
 	pushed, overwritten, evicted, rejected, waited uint64
 
@@ -249,28 +313,36 @@ type KeyedLatest[K comparable, T any] struct {
 
 // NewKeyedLatest returns an empty KeyedLatest configured by cfg.
 func NewKeyedLatest[K comparable, T any](cfg KeyedLatestConfig[K, T]) (*KeyedLatest[K, T], error) {
-	switch {
-	case cfg.Capacity <= 0:
-		return nil, errLatestCapacity
-	case cfg.Full < Reject || cfg.Full > Block:
-		return nil, errLatestFull
-	case cfg.Full == DropOldest && cfg.OnDrop == nil:
-		return nil, errLatestOnDrop
-	case cfg.BlockTimeout < 0, cfg.Full != Block && cfg.BlockTimeout != 0:
-		return nil, errBlockTimeout
+	if err := validateBuffer(cfg.Capacity, cfg.Full, cfg.BlockTimeout); err != nil {
+		return nil, err
 	}
-	return &KeyedLatest[K, T]{
-		ring:    make([]keyedEntry[K, T], cfg.Capacity),
-		index:   make(map[K]int, cfg.Capacity),
-		ready:   make(signal, 1),
-		space:   make(signal, 1),
-		done:    make(chan struct{}),
-		full:    cfg.Full,
+	if cfg.Full == DropOldest && cfg.OnDrop == nil {
+		return nil, errLatestOnDrop
+	}
+	q := &KeyedLatest[K, T]{
+		buckets: make([]int, cfg.Capacity),
+		next:    make([]int, cfg.Capacity),
+		seed:    maphash.MakeSeed(),
 		onDrop:  cfg.OnDrop,
-		timeout: cfg.BlockTimeout,
-	}, nil
+	}
+	q.initRing(cfg.Capacity, cfg.Full, cfg.BlockTimeout)
+	if cfg.Full == Block {
+		for i := range q.writers.rounds {
+			q.writers.rounds[i].signal = make(signal, 1)
+		}
+	}
+	return q, nil
 }
 
+func (q *KeyedLatest[K, T]) initRing(capacity int, full FullPolicy, timeout time.Duration) {
+	q.ring = make([]keyedEntry[K, T], capacity)
+	q.ready = make(signal, 1)
+	q.done = make(chan struct{})
+	q.full = full
+	q.timeout = timeout
+}
+
+// Set returns ErrInvalidKey if k cannot compare equal to itself, even after Close.
 // Set stores v as the newest value of k. If k is pending, its value is
 // replaced in place and the old one passed to OnDrop. Otherwise k is added
 // at the end, applying the full policy if Capacity keys are pending: Reject
@@ -282,14 +354,58 @@ func (q *KeyedLatest[K, T]) Set(ctx context.Context, k K, v T) error {
 	if q.ring == nil {
 		return errZeroKeyedLatest
 	}
-	if done, err := q.trySet(k, v, false); done {
+	if !validKey(k) {
+		return ErrInvalidKey
+	}
+	return q.set(ctx, k, v)
+}
+
+func equalValues[T comparable](a, b T) bool { return a == b }
+
+func validKey[K comparable](k K) bool {
+	return comparableValue(reflect.ValueOf(&k).Elem()) && equalValues(k, k)
+}
+
+// Interface fields in composite keys may contain slices, maps or functions.
+// Walk those values without boxing the key or provoking a comparison panic.
+func comparableValue(v reflect.Value) bool {
+	if !v.Type().Comparable() {
+		return false
+	}
+	switch v.Kind() {
+	case reflect.Interface:
+		return v.IsNil() || comparableValue(v.Elem())
+	case reflect.Struct:
+		for i := range v.NumField() { //nolint:modernize // indexing avoids boxing keys in an escaping iterator
+			if !comparableValue(v.Field(i)) {
+				return false
+			}
+		}
+	case reflect.Array:
+		kind := v.Type().Elem().Kind()
+		if kind == reflect.Interface || kind == reflect.Struct || kind == reflect.Array {
+			for i := range v.Len() {
+				if !comparableValue(v.Index(i)) {
+					return false
+				}
+			}
+		}
+	default:
+		return true // comparable scalar, pointer or channel
+	}
+	return true
+}
+
+func (q *KeyedLatest[K, T]) set(ctx context.Context, k K, v T) error {
+	done, round, err := q.trySet(k, v, nil)
+	if done {
 		return err
 	}
-	return q.blockSet(ctx, k, v)
+	return q.blockSet(ctx, k, v, round)
 }
 
 // blockSet waits for a free slot under Block and retries trySet.
-func (q *KeyedLatest[K, T]) blockSet(ctx context.Context, k K, v T) error {
+func (q *KeyedLatest[K, T]) blockSet(ctx context.Context, k K, v T, round *writerRound) error {
 	q.mu.Lock()
 	q.waited++
 	q.mu.Unlock()
@@ -300,61 +416,70 @@ func (q *KeyedLatest[K, T]) blockSet(ctx context.Context, k K, v T) error {
 		timeout = t.C
 	}
 	for {
+		wake := q.space
+		if round != nil {
+			wake = round.signal
+		}
 		select {
-		case <-q.space:
+		case <-wake:
 		case <-q.done:
 		case <-ctx.Done():
-			q.reject()
+			q.reject(round)
 			return ctx.Err()
 		case <-timeout:
-			q.reject()
+			q.reject(round)
 			return ErrFull
 		}
-		if done, err := q.trySet(k, v, true); done {
+		done, next, err := q.trySet(k, v, round)
+		round = next
+		if done {
 			return err
 		}
 	}
 }
 
 // trySet does Set without waiting. It reports done false when the policy
-// is Block and no slot is free. waited tells that the caller took a space
-// wake-up, which it passes on if a slot is still free.
-func (q *KeyedLatest[K, T]) trySet(k K, v T, waited bool) (done bool, err error) {
+// is Block and the caller must wait. Queue writers wait for space, keyed
+// writers join a notification round so a new pending key also wakes them.
+func (q *KeyedLatest[K, T]) trySet(k K, v T, round *writerRound) (done bool, next *writerRound, err error) {
 	q.mu.Lock()
+	if round != nil {
+		q.writers.leave(round)
+	}
 	if q.closed {
 		q.mu.Unlock()
-		return true, ErrQueueClosed
+		return true, nil, ErrQueueClosed
 	}
-	if i, ok := q.index[k]; ok {
+	if i := q.lookup(k); i >= 0 {
 		old := q.ring[i].v
 		q.ring[i].v = v
 		q.pushed++
 		q.overwritten++
 		more := q.n < len(q.ring)
 		q.mu.Unlock()
-		if waited && more {
-			q.space.notify() // the wake-up this Set took is not needed
+		if more {
+			q.space.notify()
 		}
 		if q.onDrop != nil {
 			q.onDrop(k, old)
 		}
-		return true, nil
+		return true, nil, nil
 	}
 	if q.n < len(q.ring) {
 		q.add(k, v)
 		more := q.n < len(q.ring)
 		q.mu.Unlock()
 		q.ready.notify()
-		if waited && more {
+		if more {
 			q.space.notify() // pass the wake-up on to another blocked Set
 		}
-		return true, nil
+		return true, nil, nil
 	}
 	switch q.full {
 	case Reject:
 		q.rejected++
 		q.mu.Unlock()
-		return true, ErrFull
+		return true, nil, ErrFull
 	case DropOldest: // full, so no Set has waited
 		old := q.removeHead()
 		q.evicted++
@@ -362,27 +487,52 @@ func (q *KeyedLatest[K, T]) trySet(k K, v T, waited bool) (done bool, err error)
 		q.mu.Unlock()
 		q.ready.notify()
 		q.onDrop(old.key, old.v)
-		return true, nil
+		return true, nil, nil
 	case Block:
+		if q.buckets != nil {
+			next = q.writers.join()
+		}
 		q.mu.Unlock()
-		return false, nil
+		return false, next, nil
 	default: // validated by NewKeyedLatest
 		q.mu.Unlock()
-		return true, errZeroKeyedLatest
+		return true, nil, errZeroKeyedLatest
 	}
 }
 
-func (q *KeyedLatest[K, T]) reject() {
+func (q *KeyedLatest[K, T]) reject(round *writerRound) {
 	q.mu.Lock()
+	if round != nil {
+		q.writers.leave(round)
+	}
 	q.rejected++
 	q.mu.Unlock()
+}
+
+func (q *KeyedLatest[K, T]) bucket(k K) uint64 {
+	return maphash.Comparable(q.seed, k) % uint64(len(q.buckets))
+}
+func (q *KeyedLatest[K, T]) lookup(k K) int {
+	if q.buckets != nil {
+		for pos := q.buckets[q.bucket(k)]; pos != 0; pos = q.next[pos-1] {
+			if q.ring[pos-1].key == k {
+				return pos - 1
+			}
+		}
+	}
+	return -1
 }
 
 // add appends k; q.mu must be held and a slot free.
 func (q *KeyedLatest[K, T]) add(k K, v T) {
 	i := (q.head + q.n) % len(q.ring)
 	q.ring[i] = keyedEntry[K, T]{k, v}
-	q.index[k] = i
+	if q.buckets != nil {
+		b := q.bucket(k)
+		q.next[i] = q.buckets[b]
+		q.buckets[b] = i + 1
+		q.writers.notify()
+	}
 	q.n++
 	q.pushed++
 }
@@ -391,7 +541,14 @@ func (q *KeyedLatest[K, T]) add(k K, v T) {
 func (q *KeyedLatest[K, T]) removeHead() keyedEntry[K, T] {
 	e := q.ring[q.head]
 	q.ring[q.head] = keyedEntry[K, T]{}
-	delete(q.index, e.key)
+	if q.buckets != nil {
+		link := &q.buckets[q.bucket(e.key)]
+		for *link != q.head+1 {
+			link = &q.next[*link-1]
+		}
+		*link = q.next[q.head]
+		q.writers.notify()
+	}
 	q.head = (q.head + 1) % len(q.ring)
 	q.n--
 	return e
@@ -474,10 +631,7 @@ func (q *KeyedLatest[K, T]) Close() error {
 		return nil
 	}
 	q.mu.Lock()
-	if !q.closed {
-		q.closed = true
-		close(q.done)
-	}
+	closeMailbox(&q.closed, q.done)
 	q.mu.Unlock()
 	return nil
 }

@@ -17,14 +17,18 @@ func TestStandardLibraryOnly(t *testing.T) {
 	if err != nil {
 		t.Skip("no go command")
 	}
-	const module = "github.com/djylb/lifecycle"
-	out, err := exec.CommandContext(t.Context(), goCmd, "list", "-deps", "-test", "-f", "{{.ImportPath}} {{.Standard}}", module+"/...").Output()
+	mod, err := exec.CommandContext(t.Context(), goCmd, "list", "-f", "{{.Module.Path}}").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	module := strings.TrimSpace(string(mod))
+	out, err := exec.CommandContext(t.Context(), goCmd, "list", "-deps", "-test", "-f", "{{if not .Standard}}{{if .Module}}{{.Module.Path}}{{else}}unknown{{end}}{{end}}", "./...").Output()
 	if err != nil {
 		t.Fatalf("go list: %v", err)
 	}
 	for line := range strings.Lines(string(out)) {
-		path, std, _ := strings.Cut(strings.TrimSpace(line), " ")
-		if std != "true" && path != module && !strings.HasPrefix(path, module+"/") && !strings.HasPrefix(path, module+".") && !strings.HasPrefix(path, module+"_") {
+		path := strings.TrimSpace(line)
+		if path != "" && path != module {
 			t.Errorf("dependency outside the standard library: %s", path)
 		}
 	}

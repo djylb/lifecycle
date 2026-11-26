@@ -83,7 +83,7 @@ func ExampleScope_Enter() {
 	s.Drain()
 	graceCtx, cancelGrace := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancelGrace()
-	if err := s.Wait(graceCtx); errors.Is(err, lifecycle.ErrNotFinished) {
+	if finished, _ := s.WaitResult(graceCtx); !finished {
 		s.Close(context.DeadlineExceeded)
 		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelCleanup()

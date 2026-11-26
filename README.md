@@ -10,9 +10,8 @@ behaviour when full is chosen up front, and newest-value-wins mailboxes.
 - `Enter` joins work in a caller-managed goroutine, such as a callback.
 - `Close` never blocks and runs no user code; `Wait` is bounded by a
   context.
-- No background goroutines: the package starts only the task goroutines,
-  at most one goroutine per scope while it closes its resources, and the
-  `context.AfterFunc` callback of a root scope whose parent context ends.
+- A root watches its cancellable parent until either context ends. Cleanup
+  runs separately and continues if a resource exits its goroutine.
 
 ```
 go get github.com/djylb/lifecycle
@@ -23,15 +22,17 @@ Requires Go 1.26 or later.
 ## Scopes
 
 ```go
-s := lifecycle.New(ctx, lifecycle.CancelOnError())
-
 ln, err := net.Listen("tcp", addr)
 if err != nil {
 	return err
 }
-s.Add(ln) // closed when the scope closes
+s := lifecycle.New(ctx, lifecycle.CancelOnError())
+if _, err := s.Add(ln); err != nil {
+	s.Close(nil)
+	return err // Add closed the refused listener
+}
 
-s.Go("accept", func(ctx context.Context) error {
+if err := s.Go("accept", func(ctx context.Context) error {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -42,16 +43,26 @@ s.Go("accept", func(ctx context.Context) error {
 			c.Close()
 			return err
 		}
-		conn.Add(c)
-		conn.Go("serve", func(ctx context.Context) error { return serve(ctx, c) })
+		if _, err := conn.Add(c); err != nil {
+			conn.Close(nil)
+			return err
+		}
+		if err := conn.Go("serve", func(ctx context.Context) error { return serve(ctx, c) }); err != nil {
+			conn.Close(nil)
+			return err
+		}
+		conn.CloseWhenIdle()
 	}
-})
+}); err != nil {
+	s.Close(nil)
+	return err
+}
 
 // Later, on shutdown:
 s.Close(nil)
 waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 defer cancel()
-err = s.Wait(waitCtx) // errors.Is(err, lifecycle.ErrNotFinished) on timeout
+err = s.Wait(waitCtx)
 ```
 
 Every scope is created with an error policy, and there is no default:
@@ -69,8 +80,17 @@ Policies are refined with two options:
 - `.Expected(fn)` decides which errors are a normal exit after the scope's
   context is cancelled. The default accepts `context.Canceled`, `ErrClosed`,
   `ErrQueueClosed` and `net.ErrClosed`. An error matching the cancellation
-  cause is also expected. During a live drain, only errors matching
-  `ErrClosed` are expected. Panics from `Go` are always reported.
+  cause is also expected. The default also accepts the scope context's own
+  deadline exit. An explicit predicate replaces the default, including this
+  deadline check. During a live drain, only errors matching
+  `ErrClosed` are expected. A joined error is filtered only when every
+  branch is expected. Panics from `Go` are always reported.
+
+If an error handler or expected-exit predicate panics or calls
+`runtime.Goexit`, the scope keeps the original report and the callback
+failure together and starts closing. A registered Closer that calls
+`runtime.Goexit` contributes `ErrGoexit` to the result. Cleanup continues
+with the remaining resources.
 
 For a batch of work, `Run` waits for every task, then closes the scope and
 returns the first error:
@@ -125,8 +145,8 @@ period, then cancels outstanding work and waits a bounded time for cleanup.
 s.Drain()
 graceCtx, cancelGrace := context.WithTimeout(context.Background(), gracePeriod)
 defer cancelGrace()
-err := s.Wait(graceCtx)
-if errors.Is(err, lifecycle.ErrNotFinished) {
+finished, err := s.WaitResult(graceCtx)
+if !finished {
 	s.Close(context.DeadlineExceeded)
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancelCleanup()
@@ -164,7 +184,7 @@ q, err := lifecycle.NewQueue(lifecycle.QueueConfig[*Job]{
 | `Full`       | Push on a full queue                                         |
 |--------------|--------------------------------------------------------------|
 | `Reject`     | returns `ErrFull`                                            |
-| `DropOldest` | removes the oldest item, passes it to `OnDrop`, adds the new |
+| `DropOldest` | commits the replacement and counters, then calls `OnDrop` with the oldest item |
 | `Block`      | waits up to `BlockTimeout` and while the context lasts       |
 
 `Close` stops new pushes and wakes every waiter; queued items remain
@@ -180,7 +200,7 @@ health updates:
 
 ```go
 cfg := lifecycle.NewLatest(lifecycle.LatestConfig[*Config]{})
-cfg.Set(c) // never blocks; replaces a value not taken yet
+cfg.Set(c) // never waits for space; replaces a value not taken yet
 
 c, missed, err := cfg.Wait(ctx) // missed: values overwritten since the last Wait
 ```
@@ -196,6 +216,10 @@ h.Set(ctx, "peer-1", Up)
 peer, state, err := h.Pop(ctx)
 ```
 
+Keys must compare equal to themselves. A non-reflexive key or a key
+containing a dynamically incomparable value makes `Set` return
+`ErrInvalidKey` before it changes the mailbox.
+
 Keys come out in the order they became pending; a `Set` on a pending key
 replaces its value in place without moving it and never hits the full
 policy, which applies only to new keys. `OnDrop` receives every value that
@@ -204,6 +228,10 @@ is overwritten or evicted before it was taken (required with
 passing them to `fn` when provided and returning how many it took. `Latest`
 takes at most one value, and `KeyedLatest` takes keys in `TryPop` order until
 the mailbox is empty. Both can take pending values after `Close`.
+For all three containers the replacement and its counters are committed
+before the synchronous `OnDrop` callback runs. If the callback panics or
+exits its goroutine, the old value belongs to the callback and the new
+value has been accepted.
 `Close`, `Stats`, `ErrFull` and `ErrQueueClosed` behave as for `Queue`.
 `Set`, `Wait` and `Pop` do not allocate, apart from the timer of a `Block`
 set that has to wait with a `BlockTimeout`.
