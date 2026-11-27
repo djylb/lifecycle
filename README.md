@@ -40,8 +40,7 @@ if err := s.Go("accept", func(ctx context.Context) error {
 		}
 		conn, err := s.Child("conn", lifecycle.Isolate(logError))
 		if err != nil {
-			c.Close()
-			return err
+			return errors.Join(err, c.Close()) // no scope owns c yet
 		}
 		if _, err := conn.Add(c); err != nil {
 			conn.Close(nil)
@@ -98,7 +97,9 @@ returns the first error:
 ```go
 err := lifecycle.Run(ctx, func(s *lifecycle.Scope) error {
 	for _, u := range urls {
-		s.Go(u, func(ctx context.Context) error { return fetch(ctx, u) })
+		if err := s.Go(u, func(ctx context.Context) error { return fetch(ctx, u) }); err != nil {
+			return err
+		}
 	}
 	return nil
 })
@@ -179,6 +180,9 @@ q, err := lifecycle.NewQueue(lifecycle.QueueConfig[*Job]{
 	Full:     lifecycle.DropOldest,
 	OnDrop:   (*Job).Release,
 })
+if err != nil {
+	return err
+}
 ```
 
 | `Full`       | Push on a full queue                                         |
@@ -200,7 +204,10 @@ health updates:
 
 ```go
 cfg := lifecycle.NewLatest(lifecycle.LatestConfig[*Config]{})
-cfg.Set(c) // never waits for space; replaces a value not taken yet
+// Set never waits for space and replaces any value that has not been taken.
+if err := cfg.Set(c); err != nil { // fails if the mailbox is closed
+	return err
+}
 
 c, missed, err := cfg.Wait(ctx) // missed: values overwritten since the last Wait
 ```
@@ -212,7 +219,12 @@ h, err := lifecycle.NewKeyedLatest(lifecycle.KeyedLatestConfig[string, Health]{
 	Capacity: 1024,
 	Full:     lifecycle.Reject, // or DropOldest (evicts the oldest key) or Block
 })
-h.Set(ctx, "peer-1", Up)
+if err != nil {
+	return err
+}
+if err := h.Set(ctx, "peer-1", Up); err != nil {
+	return err
+}
 peer, state, err := h.Pop(ctx)
 ```
 

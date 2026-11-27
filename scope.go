@@ -406,9 +406,11 @@ type scopeContext struct {
 	signal          context.Context //nolint:containedctx // carries notifications independently of the cause context
 }
 
-// A distinct notification context makes derived contexts subscribe through
-// AfterFunc, so propagation reads this context's Err and Cause together.
-func (c scopeContext) Done() <-chan struct{}           { return c.signal.Done() }
+// Done exposes the distinct notification context's channel so derived
+// contexts subscribe through AfterFunc and read this context's Err and
+// Cause together.
+func (c scopeContext) Done() <-chan struct{} { return c.signal.Done() }
+
 func (c scopeContext) AfterFunc(fn func()) func() bool { return context.AfterFunc(c.signal, fn) }
 
 func (c scopeContext) Err() error {
@@ -556,7 +558,7 @@ func (s *Scope) Err() error {
 func (s *Scope) Wait(ctx context.Context) error { _, err := s.WaitResult(ctx); return err }
 
 // WaitResult returns true and the scope result when it observes completion.
-// Otherwise it returns false and an error wrapping ErrNotFinished and the wait context cause.
+// Otherwise, it returns false and an error wrapping ErrNotFinished and the wait context cause.
 func (s *Scope) WaitResult(ctx context.Context) (bool, error) {
 	s.check()
 	select {
@@ -854,8 +856,8 @@ func closeOne(c io.Closer) error {
 // Close starts closing the scope and its descendants with cause, or with
 // ErrClosed if cause is nil, and reports whether this call started it. It
 // does not wait for tasks and runs no user code. When it returns, the
-// subtree is sealed and it has cancelled the contexts of the scopes it
-// started closing. With concurrent Close calls, a scope already being
+// subtree is sealed and the contexts of the scopes it started closing have
+// been cancelled. With concurrent Close calls, a scope already being
 // closed by another call can still have a live context. Wait on that
 // scope's [Scope.Done] channel to observe its cancellation. Use [Scope.Wait]
 // to wait for all tasks, children and resource cleanup.

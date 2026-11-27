@@ -392,7 +392,7 @@ func TestParentWaitsForChildTasks(t *testing.T) {
 func TestChildErrorReachesParent(t *testing.T) {
 	boom := errors.New("boom")
 
-	// By default a failed child stays alone.
+	// By default, a failed child stays alone.
 	s := lifecycle.New(context.Background(), lifecycle.CancelOnError())
 	k, _ := s.Child("worker", lifecycle.CancelOnError())
 	mustGo(t, k, "job", func(context.Context) error { return boom })

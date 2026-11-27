@@ -23,7 +23,7 @@ func closeMailbox(closed *bool, done chan struct{}) {
 	}
 }
 
-// signal wakes one waiter. It holds at most one token, so a send never
+// signal wakes one waiter. It holds at most one token, so sending never
 // blocks; a waiter that takes a token re-checks the state under the lock
 // and, if something is left for others, passes the token on.
 type signal chan struct{}
@@ -59,7 +59,7 @@ type LatestStats struct {
 //
 // Close stops new values and wakes every waiter. A value still pending stays
 // available to Wait, TryGet and TakePending. Once empty, Wait returns ErrQueueClosed.
-// Close implements io.Closer, so a Latest can be added to a [Scope].
+// Close implements io.Closer so callers can add the mailbox to a [Scope].
 type Latest[T any] struct {
 	mu     sync.Mutex
 	v      T
@@ -344,7 +344,7 @@ func (q *KeyedLatest[K, T]) initRing(capacity int, full FullPolicy, timeout time
 
 // Set returns ErrInvalidKey if k cannot compare equal to itself, even after Close.
 // Set stores v as the newest value of k. If k is pending, its value is
-// replaced in place and the old one passed to OnDrop. Otherwise k is added
+// replaced in place and the old one passed to OnDrop. Otherwise, k is added
 // at the end, applying the full policy if Capacity keys are pending: Reject
 // returns ErrFull, DropOldest evicts the oldest pending key and passes its
 // value to OnDrop, Block waits for a free slot, at most BlockTimeout and
@@ -376,6 +376,8 @@ func comparableValue(v reflect.Value) bool {
 	case reflect.Interface:
 		return v.IsNil() || comparableValue(v.Elem())
 	case reflect.Struct:
+		// The iterator escapes and allocates when walking composite keys.
+		//goland:noinspection GoFixStdIterators
 		for i := range v.NumField() { //nolint:modernize // indexing avoids boxing keys in an escaping iterator
 			if !comparableValue(v.Field(i)) {
 				return false

@@ -3,9 +3,9 @@ version: "2"
 linters:
   default: all
   disable:
-    # Formatting and naming style that gofmt and the code's idiom already
-    # settle: blank-line placement, short names in short scopes, the
-    # if err := f(); err != nil form, embedded-field spacing.
+    # Formatting and naming style already settled by gofmt and Go idioms:
+    # blank-line placement, short names in short scopes, inline error checks,
+    # and embedded-field spacing.
     - wsl
     - wsl_v5
     - nlreturn

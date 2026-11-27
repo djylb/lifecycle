@@ -162,7 +162,10 @@ func (c *blockingErrContext) Err() error {
 func TestIdleParentCauseOffCloseStack(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		release := make(chan struct{})
-		ctx := &blockingErrContext{unregisterContext{done: make(chan struct{})}, release}
+		ctx := &blockingErrContext{
+			unregisterContext: unregisterContext{done: make(chan struct{})},
+			release:           release,
+		}
 		root := lifecycle.New(ctx, lifecycle.CancelOnError())
 		child, err := root.Child("last", lifecycle.CancelOnError())
 		if err != nil {
@@ -190,6 +193,8 @@ type taskExitError struct{ reason any }
 
 func (taskExitError) Error() string { return "task exit" }
 func (taskExitError) Is(target error) bool {
+	// An Is method must compare the target shallowly.
+	//goland:noinspection GoTypeAssertionOnErrors
 	_, ok := target.(taskExitError)
 	return ok
 }
@@ -385,7 +390,8 @@ func TestReportedBoundaries(t *testing.T) {
 		task error
 		want error
 	}{
-		{"joined", fmt.Errorf("stop: %w", cause), nil}, {"empty", emptyBranchesError{}, emptyBranchesError{}},
+		{name: "joined", task: fmt.Errorf("stop: %w", cause)},
+		{name: "empty", task: emptyBranchesError{}, want: emptyBranchesError{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := lifecycle.New(t.Context(), lifecycle.CancelOnError())
