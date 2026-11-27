@@ -108,7 +108,6 @@ type Scope struct {
 	name         string
 	sourceDone   <-chan struct{}
 	deadlineExit *atomic.Bool
-	normalClose  bool
 	cause        error // guarded by mu, like the fields below
 	result       error
 	first        error // first error of the result
@@ -129,7 +128,8 @@ type Scope struct {
 	pending          int           // tasks and children on shards when the scope closed, not yet ended
 	state            atomic.Uint32 // written under mu, also read under shard locks
 	misses           uint32        // collision window of mu, see lockCounted
-	closingResources bool          // the closer goroutine is running or about to start
+	normalClose      bool
+	closingResources bool // the closer goroutine is running or about to start
 }
 
 // Admission closes at scopeSealing, and resource registration closes at

@@ -45,11 +45,6 @@ linters:
   settings:
     govet:
       enable-all: true
-      disable:
-        # Checked on its own, as fieldalignment; what remains are
-        # pointer-byte reports, for which fields keep their order of
-        # meaning.
-        - fieldalignment
     exhaustive:
       default-signifies-exhaustive: true
     thelper:
@@ -62,6 +57,10 @@ linters:
 
   exclusions:
     rules:
+      # Preserve field order when reordering only reduces pointer bytes.
+      - linters:
+          - govet
+        text: '^fieldalignment: .* leading bytes of pointer data'
       # Tests build errors in place, assert on values they just stored,
       # print from examples, and run the go tool by name; the
       # conversions are of generated values that fit.
